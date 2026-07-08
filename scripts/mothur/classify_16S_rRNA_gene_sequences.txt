@@ -1,0 +1,2 @@
+classify.seqs(fasta=./rawData/isolate_16S_sequences.fna, reference=./rawData/references/mothur_files/HOMD_16S_rRNA_RefSeq_V15.23.fasta, taxonomy=./rawData/references/mothur_files/HOMD_16S_rRNA_RefSeq_V15.23.mothur.taxonomy, cutoff=80)
+summary.tax(taxonomy=current)

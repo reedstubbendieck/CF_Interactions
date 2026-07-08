@@ -1,0 +1,2757 @@
+---
+title: "CF Interactions"
+author: "Reed Stubbendieck"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(circlize)
+library(ComplexHeatmap)
+library(ComplexUpset)
+library(cowplot)
+library(ggtext)
+library(multcompView)
+library(parallel)
+library(parallelDist)
+library(patchwork)
+library(pvclust)
+library(readxl)
+library(scales)
+library(tidyverse)
+library(vegan)
+
+set.seed(8675309)
+```
+
+## Load Data
+
+```{r load_data, include=FALSE}
+# --- primary metadata and assay data ---
+cf_microbiome_metadata <- read.csv("./rawData/16S_rRNA_gene_amplicon_studies/16S_CF_microbiome.csv")
+cf_isolates <- read_csv("./rawData/isolate_identification/isolate_identification.csv")
+bioassay_data <- read_csv("./rawData/cross-streak/cross-streak_inhibition_data.csv")
+
+cf_pathogens <- c("Pseudomonas", "Staphylococcus", "Burkholderia",
+                  "Stenotrophomonas", "Achromobacter", "Haemophilus",
+                  "Escherichia")
+
+# --- 16S rRNA gene mothur taxonomy summaries ---
+files <- list.files("derivedData/mothur_output", pattern = "\\.tax\\.summary$", full.names = TRUE)
+
+# --- LC-MS/MS feature table and isolate metadata ---
+lcms_dir  <- file.path("rawData", "lcms", "overall")
+lcms_diff <- read_excel(file.path(lcms_dir, "XCMS-diffreport-MultiClass.xlsx"), sheet = 1)
+lcms_meta <- read_excel(file.path("rawData", "lcms", "pseudomonas_isolate_metadata.xlsx"), sheet = 1)
+names(lcms_meta)[names(lcms_meta) == "Inhibition_Z-Score"] <- "inhibition_z"
+if (!"NB1386" %in% lcms_meta$isolate)                       # NB1386 absent from the sheet
+  lcms_meta <- bind_rows(lcms_meta, data.frame(isolate = "NB1386", host = "HID08", inhibition_z = -0.86))
+lcms_meta$inhibition <- ifelse(lcms_meta$inhibition_z >= 0, "Yes", "No")
+
+# --- LC-MS/MS total ion chromatograms (cloud plot) ---
+lcms_env  <- new.env(); load(file.path(lcms_dir, "xcms3_TIC.Rda"), envir = lcms_env)
+lcms_tics <- lcms_env$TICS.rtcor
+```
+
+## 16S rRNA gene amplicon sequencing processing
+
+```{r CF_microbiota_processing, include=FALSE}
+parse_tax_summary <- function(filepath) {
+  read_tsv(filepath, col_types = cols(.default = "c"), show_col_types = FALSE) %>%
+    mutate(taxlevel = as.integer(taxlevel), reads = as.integer(total)) %>%
+    filter(taxlevel == 6, !str_detect(taxon, "unclassified")) %>%
+    dplyr::select(taxon, reads) %>%
+    mutate(sample = sub("\\.tax\\.summary$", "", basename(filepath)))
+}
+
+get_total_reads <- function(filepath) {
+  read_tsv(filepath, col_types = cols(.default = "c"), show_col_types = FALSE, n_max = 2) %>%
+    filter(as.integer(taxlevel) == 0) %>%
+    transmute(sample = sub("\\.tax\\.summary$", "", basename(filepath)),
+              total_reads = as.integer(total))
+}
+
+keep_samples <- map_dfr(files, get_total_reads) %>%
+  filter(total_reads >= 1000) %>%
+  pull(sample)
+
+all_genera <- map_dfr(files, parse_tax_summary) %>%
+  filter(sample %in% keep_samples)
+
+metacommunity <- all_genera %>%
+  group_by(genus = taxon) %>%
+  summarize(total_reads = sum(reads), .groups = "drop") %>%
+  mutate(rel_abund = round(total_reads / sum(total_reads)*100),2) %>%
+  arrange(desc(rel_abund)) %>%
+  mutate(genus = if_else(row_number() <= 20, genus, "Other")) %>%
+  group_by(genus) %>%
+  summarize(rel_abund = sum(rel_abund), .groups = "drop") %>%
+  arrange(desc(rel_abund))
+
+genus_matrix <- all_genera %>%
+  pivot_wider(id_cols = sample, names_from = taxon,
+              values_from = reads, values_fill = 0) %>%
+  column_to_rownames("sample") %>%
+  as.matrix()
+
+row_totals <- rowSums(genus_matrix)
+row_totals[row_totals == 0] <- NA
+genus_matrix[sweep(genus_matrix, 1, row_totals, FUN = "/") < 0.001] <- 0
+
+genus_matrix <- genus_matrix[,
+  names(which(colSums(genus_matrix > 0) >= ceiling(0.01 * nrow(genus_matrix))))
+]
+
+mean_abund     <- colMeans(sweep(genus_matrix, 1, rowSums(genus_matrix), "/"), na.rm = TRUE)
+prevalence_pct <- colSums(genus_matrix > 0) / nrow(genus_matrix) * 100
+
+keep_genera <- names(mean_abund)[mean_abund * 100 > 0.5 & prevalence_pct >= 5]
+
+genus_matrix_filt <- genus_matrix[, keep_genera, drop = FALSE]
+
+write.csv(genus_matrix_filt, "derivedData/genus_matrix_filt.csv")
+```
+
+```{r metacommunity_table, include=FALSE}
+n_samples   <- length(keep_samples)
+grand_total <- sum(all_genera$reads)
+
+per_sample_ra <- all_genera %>%
+  group_by(sample) %>%
+  mutate(sample_total = sum(reads)) %>%
+  ungroup() %>%
+  mutate(ra = reads / sample_total * 100)
+
+metacommunity_table <- per_sample_ra %>%
+  group_by(genus = taxon) %>%
+  summarize(
+    metacommunity_ra = sum(reads) / grand_total * 100,
+    n_prev_01        = sum(ra >= 0.1),
+    n_prev_1         = sum(ra >= 1),
+    n_dominant       = sum(ra > 50),
+    mean_ra          = mean(ra[ra > 0]),
+    median_ra        = median(ra[ra > 0]),
+    q25_ra           = quantile(ra[ra > 0], 0.25),
+    q75_ra           = quantile(ra[ra > 0], 0.75),
+    mean_ra_dom      = ifelse(sum(ra > 50) == 0, NA_real_,
+                              mean(ra[ra > 50])),
+    median_ra_dom    = ifelse(sum(ra > 50) == 0, NA_real_,
+                              median(ra[ra > 50])),
+    q25_ra_dom       = ifelse(sum(ra > 50) == 0, NA_real_,
+                              quantile(ra[ra > 50], 0.25)),
+    q75_ra_dom       = ifelse(sum(ra > 50) == 0, NA_real_,
+                              quantile(ra[ra > 50], 0.75)),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(metacommunity_ra)) %>%
+  filter(metacommunity_ra >= 0.5) %>%
+  mutate(
+    metacommunity_ra  = round(metacommunity_ra, 1),
+    mean_ra           = round(mean_ra, 1),
+    median_ra         = round(median_ra, 1),
+    range_ra          = paste0(round(q25_ra, 1), "-", round(q75_ra, 1)),
+    prev_01_pct       = round(n_prev_01 / n_samples * 100, 1),
+    prev_1_pct        = round(n_prev_1  / n_samples * 100, 1),
+    dominant_pct      = round(n_dominant / n_samples * 100, 1),
+    bloom_given_prev  = round(
+      ifelse(n_prev_1 == 0, NA_real_, n_dominant / n_prev_1 * 100), 1),
+    mean_ra_dom       = round(mean_ra_dom, 1),
+    median_ra_dom     = round(median_ra_dom, 1),
+    range_ra_dom      = ifelse(is.na(q25_ra_dom), NA_character_,
+                               paste0(round(q25_ra_dom, 1), "-",
+                                      round(q75_ra_dom, 1)))
+  ) %>%
+  dplyr::select(
+    genus, metacommunity_ra,
+    n_prev_01, prev_01_pct,
+    n_prev_1,  prev_1_pct,
+    n_dominant, dominant_pct, bloom_given_prev,
+    mean_ra, median_ra, range_ra,
+    mean_ra_dom, median_ra_dom, range_ra_dom
+  )
+
+print(metacommunity_table, n = 30)
+
+metacommunity_csv <- metacommunity_table %>%
+  mutate(
+    median_iqr     = paste0(median_ra, " [", range_ra, "]"),
+    median_iqr_dom = ifelse(is.na(median_ra_dom), NA_character_,
+                            paste0(median_ra_dom, " [", range_ra_dom, "]"))
+  ) %>%
+  dplyr::select(
+    Genus                              = genus,
+    `Metacommunity RA (%)`             = metacommunity_ra,
+    `Mean RA (%)`                      = mean_ra,
+    `Median RA % [IQR]`                = median_iqr,
+    `Prevalence >=1% (%)`              = prev_1_pct,
+    `Dominant (>50%) (%)`              = dominant_pct,
+    `Dominant given Prev >=1% (%)`     = bloom_given_prev,
+    `Mean RA when Dominant (%)`        = mean_ra_dom,
+    `Median RA when Dominant % [IQR]`  = median_iqr_dom
+  )
+
+write.csv(metacommunity_csv, "derivedData/table_metacommunity.csv", row.names = FALSE)
+```
+
+## Bloom tests: pathogen vs oropharyngeal
+
+```{r dominance_tests, include=FALSE}
+# prevalence (>=1%): sum(ra >= 1); dominance (>50%): sum(ra > 50);
+# bloom_rate: dominance / prevalence.
+metacommunity_genera <- metacommunity_table$genus
+
+per_sample_ra_lab <- per_sample_ra %>%
+  filter(taxon %in% metacommunity_genera) %>%
+  mutate(group = ifelse(taxon %in% cf_pathogens, "pathogen", "oropharyngeal"))
+
+bloom_rate_per_genus <- per_sample_ra_lab %>%
+  group_by(taxon, group) %>%
+  summarize(n_prev_1   = sum(ra >= 1),
+            n_dominant = sum(ra > 50),
+            .groups    = "drop") %>%
+  filter(n_prev_1 > 0) %>%
+  mutate(bloom_rate = n_dominant / n_prev_1 * 100)
+
+q1_wilcox <- wilcox.test(bloom_rate ~ group, data = bloom_rate_per_genus,
+                         exact = FALSE)
+print(q1_wilcox)
+bloom_rate_per_genus %>%
+  group_by(group) %>%
+  summarize(n_genera    = n(),
+            median_rate = median(bloom_rate),
+            q25         = quantile(bloom_rate, 0.25),
+            q75         = quantile(bloom_rate, 0.75)) %>%
+  print()
+
+dominant_obs <- per_sample_ra_lab %>% filter(ra > 50)
+
+q2_wilcox <- wilcox.test(ra ~ group, data = dominant_obs, exact = FALSE)
+print(q2_wilcox)
+dominant_obs %>%
+  group_by(group) %>%
+  summarize(n_dominant_samples = n(),
+            median_ra          = median(ra),
+            q25                = quantile(ra, 0.25),
+            q75                = quantile(ra, 0.75)) %>%
+  print()
+
+pathogen_dominant <- dominant_obs %>%
+  filter(group == "pathogen") %>%
+  mutate(taxon = factor(taxon))
+
+q3_kw <- kruskal.test(ra ~ taxon, data = pathogen_dominant)
+print(q3_kw)
+pathogen_dominant %>%
+  group_by(taxon) %>%
+  summarize(n_dominant_samples = n(),
+            median_ra          = median(ra),
+            q25                = quantile(ra, 0.25),
+            q75                = quantile(ra, 0.75)) %>%
+  arrange(desc(median_ra)) %>%
+  print()
+```
+
+## NMDS
+
+```{r nmds, include=FALSE}
+rel_abund_matrix <- sweep(genus_matrix, 1, rowSums(genus_matrix), "/")
+rel_abund_matrix[is.nan(rel_abund_matrix)] <- 0
+
+dir.create("r_objects", showWarnings = FALSE)
+
+if (file.exists("r_objects/bray_dist.rds") && file.exists("r_objects/nmds.rds")) {
+  bray_dist <- readRDS("r_objects/bray_dist.rds")
+  nmds      <- readRDS("r_objects/nmds.rds")
+} else {
+  bray_dist <- parDist(rel_abund_matrix, method = "bray")
+
+  n_cores <- max(1, parallel::detectCores() - 1)
+  cl      <- makeCluster(n_cores)
+  clusterEvalQ(cl, library(vegan))
+  clusterExport(cl, "bray_dist")
+
+  starts <- parLapply(cl, seq_len(20), function(i) monoMDS(bray_dist, k = 2, maxit = 500))
+  stopCluster(cl)
+
+  nmds <- starts[[which.min(sapply(starts, `[[`, "stress"))]]
+
+  saveRDS(bray_dist, "r_objects/bray_dist.rds")
+  saveRDS(nmds,      "r_objects/nmds.rds")
+}
+
+nmds_scores <- as.data.frame(scores(nmds, display = "sites")) %>%
+  rownames_to_column("Run") %>%
+  left_join(cf_microbiome_metadata, by = "Run")
+
+nmds_stress <- nmds$stress
+```
+
+### Beta Diversity: PERMANOVA
+
+```{r permanova, include=FALSE}
+if (file.exists("r_objects/permanova_combined.rds")) {
+  permanova_combined <- readRDS("r_objects/permanova_combined.rds")
+} else {
+  set.seed(8675309)
+  N_PERM <- 9999
+
+  bray_mat <- as.matrix(bray_dist)
+
+  cf_microbiome_metadata$Age_bin <- cut(cf_microbiome_metadata$Age,
+    breaks = c(-Inf, 2, 12, 18, 40, Inf), right = FALSE,
+    labels = c("Infant", "Child", "Adolescent", "Adult", "Senior"))
+
+  cf_microbiome_metadata$FEV1_bin <- cut(cf_microbiome_metadata$FEV1,
+    breaks = c(-Inf, 30, 50, 80, Inf), right = FALSE,
+    labels = c("Very Severe", "Severe", "Moderate", "Mild"))
+
+  keep_idx <- function(meta, variable) {
+    x <- meta[[variable]]
+    which(!is.na(x) & !(is.character(x) & x == ""))
+  }
+
+  tech_vars       <- c("BioProject", "Region")
+  bio_vars        <- c("Sex", "Age", "FEV1", "Sample_Type")
+  binned_vars     <- c("Age_bin", "FEV1_bin")
+  partial_vars    <- c(bio_vars, binned_vars)
+  partial_st_vars <- c("Sex", "Age_bin", "FEV1_bin")
+
+  tasks <- c(
+    lapply(c(tech_vars, bio_vars, binned_vars),
+           function(v) list(type = "unadj",           variable = v)),
+    lapply(partial_vars,
+           function(v) list(type = "partial_br",      variable = v)),
+    lapply(partial_st_vars,
+           function(v) list(type = "partial_brst",    variable = v)),
+    list(list(type = "joint_technical",
+              variable = "BioProject + Region + Sample_Type"))
+  )
+
+  n_cores <- max(1, parallel::detectCores() - 1)
+  cl      <- parallel::makeCluster(n_cores)
+  parallel::clusterEvalQ(cl, library(vegan))
+  parallel::clusterExport(cl, c("cf_microbiome_metadata", "bray_mat",
+                                 "keep_idx", "N_PERM"))
+
+  results <- parallel::parLapply(cl, tasks, function(task) {
+    meta <- cf_microbiome_metadata
+    v    <- task$variable
+
+    if (task$type == "unadj") {
+      idx      <- keep_idx(meta, v)
+      dist_sub <- as.dist(bray_mat[idx, idx])
+      meta_sub <- meta[idx, , drop = FALSE]
+      f <- as.formula(paste("dist_sub ~", v))
+      environment(f) <- environment()
+      res <- as.data.frame(adonis2(f, data = meta_sub, permutations = N_PERM))
+      res <- res[!rownames(res) %in% c("Residual", "Total"), , drop = FALSE]
+      return(data.frame(variable = v, n = length(idx), Df = res$Df,
+                        R2 = round(res$R2, 4), F = round(res$F, 3),
+                        p.value = res[["Pr(>F)"]], model = "unadjusted",
+                        row.names = NULL, check.names = FALSE))
+    }
+
+    if (task$type == "partial_br") {
+      idx      <- keep_idx(meta, v)
+      dist_sub <- as.dist(bray_mat[idx, idx])
+      meta_sub <- meta[idx, , drop = FALSE]
+      f <- as.formula(paste("dist_sub ~ BioProject + Region +", v))
+      environment(f) <- environment()
+      res <- as.data.frame(adonis2(f, data = meta_sub,
+                                   permutations = N_PERM, by = "margin"))
+      res <- res[v, , drop = FALSE]
+      return(data.frame(variable = v, n = length(idx), Df = res$Df,
+                        R2 = round(res$R2, 4), F = round(res$F, 3),
+                        p.value = res[["Pr(>F)"]],
+                        model = "partial (| BioProject + Region)",
+                        row.names = NULL, check.names = FALSE))
+    }
+
+    if (task$type == "partial_brst") {
+      idx      <- keep_idx(meta, v)
+      idx      <- idx[!is.na(meta$Sample_Type[idx]) & meta$Sample_Type[idx] != ""]
+      dist_sub <- as.dist(bray_mat[idx, idx])
+      meta_sub <- meta[idx, , drop = FALSE]
+      f <- as.formula(paste("dist_sub ~ BioProject + Region + Sample_Type +", v))
+      environment(f) <- environment()
+      res <- as.data.frame(adonis2(f, data = meta_sub,
+                                   permutations = N_PERM, by = "margin"))
+      res <- res[v, , drop = FALSE]
+      return(data.frame(variable = v, n = length(idx), Df = res$Df,
+                        R2 = round(res$R2, 4), F = round(res$F, 3),
+                        p.value = res[["Pr(>F)"]],
+                        model = "partial (| BioProject + Region + Sample_Type)",
+                        row.names = NULL, check.names = FALSE))
+    }
+
+    if (task$type == "joint_technical") {
+      idx      <- which(!is.na(meta$Sample_Type) & meta$Sample_Type != "")
+      dist_sub <- as.dist(bray_mat[idx, idx])
+      meta_sub <- meta[idx, , drop = FALSE]
+      res <- as.data.frame(adonis2(
+        dist_sub ~ BioProject + Region + Sample_Type,
+        data = meta_sub, permutations = N_PERM))
+      res <- res["Model", , drop = FALSE]
+      return(data.frame(variable = v, n = length(idx), Df = res$Df,
+                        R2 = round(res$R2, 4), F = round(res$F, 3),
+                        p.value = res[["Pr(>F)"]], model = "joint technical",
+                        row.names = NULL, check.names = FALSE))
+    }
+  })
+
+  parallel::stopCluster(cl)
+
+  permanova_combined       <- do.call(rbind, results)
+  permanova_combined$p.adj <- p.adjust(permanova_combined$p.value, method = "BH")
+
+  saveRDS(permanova_combined, "r_objects/permanova_combined.rds")
+}
+
+print(permanova_combined, digits = 3, row.names = FALSE)
+
+technical_joint_R2 <- permanova_combined$R2[permanova_combined$model == "joint technical"]
+
+if (file.exists("r_objects/permanova_subsampling_summary.rds")) {
+  permanova_subsampling_summary <- readRDS("r_objects/permanova_subsampling_summary.rds")
+} else {
+  set.seed(8675309)
+  N_PERM_SUB <- 999
+  N_REPS     <- 1000
+  SUB_N      <- 100
+  bray_mat <- as.matrix(bray_dist)
+
+  if (!"Age_bin" %in% colnames(cf_microbiome_metadata)) {
+    cf_microbiome_metadata$Age_bin <- cut(cf_microbiome_metadata$Age,
+      breaks = c(-Inf, 2, 12, 18, 40, Inf), right = FALSE,
+      labels = c("Infant", "Child", "Adolescent", "Adult", "Senior"))
+  }
+  if (!"FEV1_bin" %in% colnames(cf_microbiome_metadata)) {
+    cf_microbiome_metadata$FEV1_bin <- cut(cf_microbiome_metadata$FEV1,
+      breaks = c(-Inf, 30, 50, 80, Inf), right = FALSE,
+      labels = c("Very Severe", "Severe", "Moderate", "Mild"))
+  }
+
+  keep_idx_fn <- function(meta, variable) {
+    x <- meta[[variable]]
+    which(!is.na(x) & !(is.character(x) & x == ""))
+  }
+
+  sub_vars <- c("Sex", "Age_bin", "FEV1_bin")
+  sub_tasks <- expand.grid(variable = sub_vars, rep = seq_len(N_REPS),
+                           stringsAsFactors = FALSE) %>%
+    apply(1, function(row) list(variable = row[["variable"]],
+                                rep = as.integer(row[["rep"]])))
+
+  n_cores <- max(1, parallel::detectCores() - 1)
+  cl <- parallel::makeCluster(n_cores)
+  parallel::clusterEvalQ(cl, library(vegan))
+  parallel::clusterExport(cl, c("cf_microbiome_metadata", "bray_mat",
+                                "keep_idx_fn", "N_PERM_SUB", "SUB_N"),
+                          envir = environment())
+
+  sub_results <- parallel::parLapply(cl, sub_tasks, function(task) {
+    meta <- cf_microbiome_metadata
+    v    <- task$variable
+    idx_full <- keep_idx_fn(meta, v)
+    if (length(idx_full) < SUB_N) {
+      return(list(variable = v, rep = task$rep, R2 = NA, pval = NA))
+    }
+    set.seed(task$rep * 1000 + SUB_N +
+             as.integer(factor(v, levels = c("Sex","Age_bin","FEV1_bin"))))
+    idx <- sample(idx_full, SUB_N)
+    dist_sub <- as.dist(bray_mat[idx, idx])
+    meta_sub <- meta[idx, ]
+    f <- as.formula(paste("dist_sub ~", v))
+    environment(f) <- environment()
+    res <- tryCatch(adonis2(f, data = meta_sub, permutations = N_PERM_SUB),
+                    error = function(e) NULL)
+    if (is.null(res)) return(list(variable = v, rep = task$rep, R2 = NA, pval = NA))
+    res <- as.data.frame(res)
+    list(variable = v, rep = task$rep,
+         R2 = res["Model", "R2"], pval = res["Model", "Pr(>F)"])
+  })
+  parallel::stopCluster(cl)
+
+  permanova_subsampling <- do.call(rbind, lapply(sub_results, function(r)
+    data.frame(variable = r$variable, N = SUB_N, rep = r$rep,
+               R2 = r$R2, pval = r$pval,
+               sig = !is.na(r$pval) & r$pval < 0.05,
+               stringsAsFactors = FALSE)))
+  saveRDS(permanova_subsampling, "r_objects/permanova_subsampling.rds")
+
+  permanova_subsampling_summary <- permanova_subsampling %>%
+    group_by(variable, N) %>%
+    summarize(frac_sig = mean(sig, na.rm = TRUE),
+              mean_R2  = mean(R2,  na.rm = TRUE),
+              sd_R2    = sd(R2,   na.rm = TRUE),
+              .groups  = "drop")
+  saveRDS(permanova_subsampling_summary, "r_objects/permanova_subsampling_summary.rds")
+}
+
+print(as.data.frame(permanova_subsampling_summary))
+```
+
+## Alpha Diversity vs FEV1
+
+```{r alpha_diversity_fev1, include=FALSE}
+parse_tax_genus <- function(filepath) {
+  read_tsv(filepath, col_types = cols(.default = "c"), show_col_types = FALSE) %>%
+    mutate(taxlevel = as.integer(taxlevel), reads = as.integer(total)) %>%
+    filter(taxlevel == 6, !str_detect(taxon, "unclassified")) %>%
+    dplyr::select(taxon, reads) %>%
+    mutate(sample = sub("\\.tax\\.summary$", "", basename(filepath)))
+}
+
+sample_totals <- map_dfr(files, function(f) {
+  read_tsv(f, col_types = cols(.default = "c"), show_col_types = FALSE, n_max = 2) %>%
+    filter(as.integer(taxlevel) == 0) %>%
+    transmute(sample = sub("\\.tax\\.summary$", "", basename(f)),
+              total_reads = as.integer(total))
+}) %>% filter(total_reads >= 1000)
+
+good_samples <- sample_totals$sample
+
+mat_genus <- map_dfr(files, parse_tax_genus) %>%
+  filter(sample %in% good_samples) %>%
+  pivot_wider(id_cols = sample, names_from = taxon,
+              values_from = reads, values_fill = 0) %>%
+  column_to_rownames("sample") %>%
+  as.matrix()
+
+alpha_df <- data.frame(
+  sample  = rownames(mat_genus),
+  shannon = vegan::diversity(mat_genus, index = "shannon"),
+  stringsAsFactors = FALSE
+)
+
+alpha_df <- alpha_df %>%
+  left_join(cf_microbiome_metadata %>% dplyr::select(Run, FEV1, Age, BioProject, Sample_Type, Region),
+            by = c("sample" = "Run")) %>%
+  filter(!is.na(FEV1), FEV1 != "") %>%
+  mutate(FEV1 = as.numeric(FEV1),
+         Age  = as.numeric(Age))
+
+alpha_df <- alpha_df %>%
+  mutate(FEV1_bin = cut(FEV1,
+    breaks = c(-Inf, 30, 50, 80, Inf), right = FALSE,
+    labels = c("Very Severe", "Severe", "Moderate", "Mild")))
+
+# Adjust Shannon for Age + BioProject + Sample_Type + Region (residuals + grand mean)
+complete <- !is.na(alpha_df$Age) & !is.na(alpha_df$BioProject) &
+            !is.na(alpha_df$Sample_Type) & alpha_df$Sample_Type != "" &
+            !is.na(alpha_df$Region) & alpha_df$Region != ""
+alpha_df$shannon_adj <- NA_real_
+fit_s <- lm(shannon ~ Age + BioProject + Sample_Type + Region, data = alpha_df[complete, ])
+alpha_df$shannon_adj[complete] <- residuals(fit_s) + mean(alpha_df$shannon[complete])
+
+alpha_adj <- alpha_df %>% filter(!is.na(shannon_adj))
+
+kw_result <- kruskal.test(shannon_adj ~ FEV1_bin, data = alpha_adj)
+print(kw_result)
+
+pw_result <- pairwise.wilcox.test(alpha_adj$shannon_adj, alpha_adj$FEV1_bin,
+                                   p.adjust.method = "BH", exact = FALSE)
+print(pw_result$p.value)
+```
+
+## Berger-Parker Dominance
+
+```{r berger_parker_prep, include=FALSE}
+pathogen_cols   <- intersect(cf_pathogens, colnames(mat_genus))
+pathogen_reads  <- rowSums(mat_genus[, pathogen_cols, drop = FALSE])
+bp_dom_vec      <- apply(mat_genus, 1, max) / rowSums(mat_genus)
+pathogen_frac   <- pathogen_reads / rowSums(mat_genus)
+dominant_genus  <- colnames(mat_genus)[max.col(mat_genus, ties.method = "first")]
+
+bp_df <- data.frame(
+  sample           = rownames(mat_genus),
+  bp_dom           = bp_dom_vec,
+  pathogen_frac    = pathogen_frac,
+  dominant_genus   = dominant_genus,
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    dominant_pathogen = if_else(dominant_genus %in% cf_pathogens,
+                                dominant_genus, "Other")
+  ) %>%
+  left_join(
+    cf_microbiome_metadata %>%
+      dplyr::select(Run, FEV1, Age, BioProject, Sample_Type, Region),
+    by = c("sample" = "Run")
+  ) %>%
+  filter(!is.na(FEV1), FEV1 != "") %>%
+  mutate(
+    FEV1     = as.numeric(FEV1),
+    Age      = as.numeric(Age),
+    FEV1_bin = cut(FEV1,
+                   breaks = c(-Inf, 30, 50, 80, Inf), right = FALSE,
+                   labels = c("Very Severe", "Severe", "Moderate", "Mild"))
+  )
+
+bp_complete <- !is.na(bp_df$Age) &
+               !is.na(bp_df$BioProject) &
+               !is.na(bp_df$Sample_Type) & bp_df$Sample_Type != "" &
+               !is.na(bp_df$Region)      & bp_df$Region      != ""
+
+fit_bp <- lm(bp_dom ~ Age + BioProject + Sample_Type + Region,
+             data = bp_df[bp_complete, ])
+bp_df$bp_adj <- NA_real_
+bp_df$bp_adj[bp_complete] <- residuals(fit_bp) + mean(bp_df$bp_dom[bp_complete])
+
+fit_fev1 <- lm(FEV1 ~ Age + BioProject + Sample_Type + Region,
+               data = bp_df[bp_complete, ])
+bp_df$FEV1_adj <- NA_real_
+bp_df$FEV1_adj[bp_complete] <- residuals(fit_fev1) + mean(bp_df$FEV1[bp_complete])
+
+bp_adj_df <- bp_df %>% filter(!is.na(bp_adj))
+
+n_boot_bp <- 100
+n_bp      <- nrow(bp_adj_df)
+boot_lines_bp <- do.call(rbind, lapply(seq_len(n_boot_bp), function(b) {
+  bi  <- sample(seq_len(n_bp), replace = TRUE)
+  fit <- lm(bp_adj_df$FEV1_adj[bi] ~ bp_adj_df$bp_dom[bi])
+  data.frame(x    = range(bp_adj_df$bp_dom),
+             y    = coef(fit)[1] + coef(fit)[2] * range(bp_adj_df$bp_dom),
+             boot = b)
+}))
+
+bp_full_lm  <- lm(FEV1 ~ bp_dom + Age + BioProject + Sample_Type + Region,
+                  data = bp_df[bp_complete, ])
+bp_full_s   <- summary(bp_full_lm)
+bp_coef_row <- bp_full_s$coefficients["bp_dom", ]
+bp_p_fmt    <- format(bp_coef_row["Pr(>|t|)"], digits = 2, scientific = TRUE)
+bp_stat_label <- paste0("italic(P)[adj] == ", bp_p_fmt)
+
+print(bp_full_s$coefficients["bp_dom", ])
+sprintf("Adj. R^2 = %.3f", bp_full_s$adj.r.squared)
+```
+
+## Interaction Analyses
+
+```{r pairwise_cooccurrence, include=FALSE}
+genera   <- colnames(genus_matrix_filt)
+n_genera <- length(genera)
+
+log_abund <- log10(genus_matrix_filt + 1)
+
+pairs   <- combn(genera, 2)
+n_pairs <- ncol(pairs)
+bonf_thresh <- 0.05 / n_pairs
+
+pw_res <- vector("list", n_pairs)
+for (k in seq_len(n_pairs)) {
+  g1 <- pairs[1, k]; g2 <- pairs[2, k]
+  fit <- lm(log_abund[, g1] ~ log_abund[, g2])
+  s   <- summary(fit)
+  pw_res[[k]] <- data.frame(genus1 = g1, genus2 = g2,
+                             bx = coef(fit)[2], pval = s$coefficients[2, 4],
+                             stringsAsFactors = FALSE)
+}
+pairwise_results <- do.call(rbind, pw_res)
+pairwise_results$significant <- pairwise_results$pval < bonf_thresh
+
+edge_list <- pairwise_results %>%
+  filter(significant) %>%
+  mutate(direction = ifelse(bx > 0, "positive", "negative"))
+
+sig_pairs <- pairwise_results %>%
+  filter(significant) %>%
+  mutate(
+    g1_path   = genus1 %in% cf_pathogens,
+    g2_path   = genus2 %in% cf_pathogens,
+    pair_type = case_when(
+      g1_path & g2_path   ~ "pathogen-pathogen",
+      g1_path | g2_path   ~ "pathogen-anaerobe",
+      TRUE                ~ "anaerobe-anaerobe"
+    ),
+    direction = ifelse(bx > 0, "positive", "negative")
+  )
+
+pair_dir_summary <- sig_pairs %>%
+  count(pair_type, direction) %>%
+  group_by(pair_type) %>%
+  mutate(total = sum(n), pct = 100 * n / total) %>%
+  ungroup()
+
+print(as.data.frame(pair_dir_summary))
+print(sig_pairs %>% count(pair_type))
+```
+
+```{r pathogenic_interaction_model, include=FALSE}
+fev1_meta <- cf_microbiome_metadata %>%
+  filter(Run %in% rownames(genus_matrix_filt), !is.na(FEV1), FEV1 != "")
+fev1_runs <- fev1_meta$Run
+fev1_vals <- as.numeric(fev1_meta$FEV1)
+log_fev1  <- log_abund[fev1_runs, , drop = FALSE]
+
+int_res <- vector("list", n_pairs)
+for (k in seq_len(n_pairs)) {
+  g1 <- pairs[1, k]; g2 <- pairs[2, k]
+  pn <- log_fev1[, g1]; px <- log_fev1[, g2]
+  fit <- lm(fev1_vals ~ pn + px + pn:px)
+  s   <- summary(fit)
+  coefs <- s$coefficients
+  bi   <- if ("pn:px" %in% rownames(coefs)) coefs["pn:px", "Estimate"] else NA
+  pval <- if ("pn:px" %in% rownames(coefs)) coefs["pn:px", "Pr(>|t|)"] else NA
+  int_res[[k]] <- data.frame(genus1 = g1, genus2 = g2, bi = bi,
+                              pval_interaction = pval, stringsAsFactors = FALSE)
+}
+interaction_df <- do.call(rbind, int_res) %>% filter(!is.na(bi))
+interaction_df$fdr_interaction <- p.adjust(interaction_df$pval_interaction, method = "BH")
+interaction_df$sig_interaction <- interaction_df$fdr_interaction < 0.05
+
+sig_taxa <- unique(c(interaction_df$genus1[interaction_df$sig_interaction],
+                     interaction_df$genus2[interaction_df$sig_interaction]))
+pa_matrix     <- (genus_matrix_filt[fev1_runs, sig_taxa, drop = FALSE] > 0) * 1
+n_interacting <- rowSums(pa_matrix)
+bioproject    <- fev1_meta$BioProject
+sample_type   <- fev1_meta$Sample_Type
+region        <- fev1_meta$Region
+
+fev1_age_raw <- fev1_meta %>%
+  mutate(Age_bin = case_when(
+    is.na(Age)           ~ "NA",
+    Age < 12             ~ "0\u201311",
+    Age >= 12 & Age < 18 ~ "12\u201317",
+    Age >= 18 & Age < 40 ~ "18\u201339",
+    Age >= 40            ~ "40+"
+  )) %>% pull(Age_bin)
+
+age_levels_raw <- c("0\u201311", "12\u201317", "18\u201339", "40+", "NA")
+age_counts     <- table(factor(fev1_age_raw, levels = age_levels_raw))
+age_label_map  <- setNames(paste0(names(age_counts), " (N=", age_counts, ")"),
+                           names(age_counts))
+fev1_age <- age_label_map[fev1_age_raw]
+
+fev1_age_vals <- as.numeric(fev1_meta$Age)
+complete_idx  <- !is.na(fev1_age_vals) & !is.na(bioproject) &
+                 !is.na(sample_type) & sample_type != "" &
+                 !is.na(region) & region != ""
+confound_fit  <- lm(fev1_vals[complete_idx] ~ fev1_age_vals[complete_idx] +
+                    bioproject[complete_idx] + sample_type[complete_idx] +
+                    region[complete_idx])
+fev1_adjusted <- residuals(confound_fit) + mean(fev1_vals[complete_idx], na.rm = TRUE)
+n_interacting_adj <- n_interacting[complete_idx]
+fev1_age_adj      <- fev1_age[complete_idx]
+
+n_boot_val <- 100
+n_adj <- length(fev1_adjusted)
+boot_lines_adj <- do.call(rbind, lapply(seq_len(n_boot_val), function(b) {
+  bi <- sample(seq_len(n_adj), replace = TRUE)
+  fit <- lm(fev1_adjusted[bi] ~ n_interacting_adj[bi])
+  data.frame(x = range(n_interacting_adj),
+             y = coef(fit)[1] + coef(fit)[2] * range(n_interacting_adj), boot = b)
+}))
+
+adj_full_lm <- lm(fev1_vals[complete_idx] ~ n_interacting[complete_idx] +
+                     fev1_age_vals[complete_idx] + bioproject[complete_idx] +
+                     sample_type[complete_idx] + region[complete_idx])
+adj_full_s  <- summary(adj_full_lm)
+adj_coef <- signif(adj_full_s$coefficients["n_interacting[complete_idx]", "Estimate"], 2)
+adj_r2   <- signif(adj_full_s$r.squared, 2)
+adj_p    <- format(adj_full_s$coefficients["n_interacting[complete_idx]", "Pr(>|t|)"],
+                   digits = 2, scientific = TRUE)
+adj_stat_label <- paste0("italic(P)[adj] == ", adj_p,
+                         "~~R[adj]^2 == ", adj_r2,
+                         "~~beta == '+'*", adj_coef, "*'%'~FEV[1]~Genus^-1")
+```
+
+## Alpha Diversity vs Interactions Effect Comparison
+
+```{r alpha_vs_interactions_effect, include=FALSE}
+alpha_genus_vals <- alpha_adj %>%
+  dplyr::select(sample, shannon)
+
+effect_df <- data.frame(
+  sample        = fev1_runs,
+  fev1          = fev1_vals,
+  n_interacting = n_interacting,
+  age           = as.numeric(fev1_meta$Age),
+  bioproject    = bioproject,
+  stringsAsFactors = FALSE
+) %>%
+  left_join(alpha_genus_vals, by = "sample") %>%
+  filter(!is.na(age), !is.na(shannon))
+
+effect_std   <- lm(fev1 ~ scale(shannon) + scale(n_interacting) + age + bioproject,
+                   data = effect_df)
+effect_std_s <- summary(effect_std)
+print(effect_std_s$coefficients[c("scale(shannon)", "scale(n_interacting)"), ])
+
+bp_std_lm <- lm(FEV1 ~ scale(bp_dom) + Age + BioProject + Sample_Type + Region,
+                data = bp_df[bp_complete, ])
+print(summary(bp_std_lm)$coefficients["scale(bp_dom)", ])
+```
+
+## Process Bioassay Data
+
+```{r process_bioassay_data, include=FALSE}
+bioassay_data <- bioassay_data %>%
+  mutate(zoi = zoi / 10) %>%
+  mutate(inhibition = case_when(
+    zoi == 0           ~ 0,
+    zoi > 0 & zoi < 1  ~ 1,
+    zoi >= 1 & zoi < 2 ~ 2,
+    zoi >= 2           ~ 3
+  ))
+
+inhibition_counts <- bioassay_data %>%
+  count(inhibition) %>%
+  mutate(
+    inhibition = factor(inhibition, levels = 0:3),
+    fraction   = n / sum(n),
+    ymax       = cumsum(fraction),
+    ymin       = dplyr::lag(ymax, default = 0)
+  )
+
+total_assays    <- sum(inhibition_counts$n)
+formatted_total <- comma(total_assays)
+
+target_hits <- bioassay_data %>%
+  mutate(inhibition = as.integer(inhibition)) %>%
+  count(target, inhibition, name = "n") %>%
+  group_by(target) %>%
+  mutate(
+    n_total = sum(n),
+    prop    = n / n_total * 100
+  ) %>%
+  ungroup() %>%
+  filter(inhibition %in% 1:3) %>%
+  group_by(target) %>%
+  mutate(hit_rate = sum(prop)) %>%
+  ungroup() %>%
+  mutate(target = case_when(
+      target == "Achromobacter xylosoxidans" ~ "*A. xylosoxidans*",
+      target == "Burkholderia cenocepacia"   ~ "*B. cenocepacia*",
+      target == "Burkholderia cepacia"       ~ "*B. cepacia*",
+      target == "Neisseria meningitidis"     ~ "*N. meningitidis*",
+      target == "Pseudomonas aeruginosa"     ~ "*P. aeruginosa*",
+      target == "Rothia mucilaginosa"        ~ "*R. mucilaginosa*",
+      target == "Staphylococcus aureus"      ~ "*S. aureus*",
+      target == "Streptococcus oralis"       ~ "*S. oralis*",
+      TRUE ~ target
+    ),
+    target     = forcats::fct_reorder(target, hit_rate, .desc = TRUE),
+    inhibition = factor(inhibition, levels = c(1, 2, 3))
+  )
+
+isolate_inhibition <- left_join(bioassay_data, cf_isolates, by = "isolate")
+
+isolate_inhibition <- isolate_inhibition %>%
+  dplyr::select(isolate, hid, genus, target, inhibition) %>%
+  mutate(genus = case_when(
+    genus == "Staphylococcus"     ~ "*Staphylococcus*",
+    genus == "Pseudomonas"        ~ "*Pseudomonas*",
+    genus == "Bacillus"           ~ "*Bacillus*",
+    genus == "Enterococcus"       ~ "*Enterococcus*",
+    genus == "Lacticaseibacillus" ~ "*Lacticaseibacillus*",
+    genus == "Klebsiella"         ~ "*Klebsiella*",
+    genus == "Streptococcus"      ~ "*Streptococcus*",
+    genus == "Escherichia"        ~ "*Escherichia*",
+    genus == "Stenotrophomonas"   ~ "*Stenotrophomonas*",
+    genus == "Microbacterium"     ~ "*Microbacterium*",
+    TRUE ~ "Other"
+  )) %>%
+  filter(genus != "Other") %>%
+  group_by(genus) %>%
+  mutate(N_isolates = n_distinct(isolate)) %>%
+  group_by(genus, inhibition) %>%
+  summarize(
+    count = n(),
+    N_isolates = dplyr::first(N_isolates),
+    .groups = "drop"
+  ) %>%
+  group_by(genus) %>%
+  mutate(
+    inhibition = factor(as.character(inhibition), levels = c("0", "1", "2", "3")),
+    percent    = count / sum(count),
+    inhib_pct  = sum(percent[inhibition %in% c("1", "2", "3")], na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(genus = forcats::fct_reorder(genus, inhib_pct, .desc = TRUE))
+
+total_inhibition_per_isolate <- bioassay_data %>%
+  group_by(isolate) %>%
+  filter(n_distinct(target) == 8) %>%
+  summarize(total_inhibition_score = sum(inhibition, na.rm = TRUE), .groups = "drop")
+
+total_inhibition_per_isolate <- left_join(total_inhibition_per_isolate, cf_isolates, by = "isolate")
+
+total_inhibition_per_isolate <- total_inhibition_per_isolate %>%
+  dplyr::select(isolate, hid, genus, total_inhibition_score) %>%
+  mutate(genus = case_when(
+    genus == "Staphylococcus"     ~ "*Staphylococcus*",
+    genus == "Pseudomonas"        ~ "*Pseudomonas*",
+    genus == "Bacillus"           ~ "*Bacillus*",
+    genus == "Enterococcus"       ~ "*Enterococcus*",
+    genus == "Lacticaseibacillus" ~ "*Lacticaseibacillus*",
+    genus == "Klebsiella"         ~ "*Klebsiella*",
+    genus == "Streptococcus"      ~ "*Streptococcus*",
+    genus == "Escherichia"        ~ "*Escherichia*",
+    genus == "Stenotrophomonas"   ~ "*Stenotrophomonas*",
+    genus == "Microbacterium"     ~ "*Microbacterium*",
+    TRUE ~ "Other"
+  )) %>%
+  filter(genus != "Other") %>%
+  group_by(genus) %>%
+  mutate(
+    .sd_g = sd(total_inhibition_score, na.rm = TRUE),
+    .mn_g = mean(total_inhibition_score, na.rm = TRUE),
+    z_within_genus = ifelse(.sd_g > 0,
+                            (total_inhibition_score - .mn_g) / .sd_g,
+                            0)
+  ) %>%
+  ungroup() %>%
+  dplyr::select(-.sd_g, -.mn_g) %>%
+  mutate(
+    .sd_all = sd(total_inhibition_score, na.rm = TRUE),
+    .mn_all = mean(total_inhibition_score, na.rm = TRUE),
+    z_overall = ifelse(.sd_all > 0,
+                       (total_inhibition_score - .mn_all) / .sd_all,
+                       0)
+  ) %>%
+  dplyr::select(-.sd_all, -.mn_all)
+
+# order both figures by decreasing median z_overall from Fig 4B
+median_order <- total_inhibition_per_isolate %>%
+  group_by(genus) %>%
+  summarize(med = median(z_overall, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(med)) %>%
+  pull(genus) %>%
+  as.character()
+
+total_inhibition_per_isolate <- total_inhibition_per_isolate %>%
+  mutate(genus = factor(as.character(genus), levels = median_order)) %>%
+  filter(!is.na(genus))
+```
+
+### Stats: Chi-square by Target
+
+```{r stats_chi_target, include=FALSE}
+target_hits_stats <- bioassay_data %>%
+  mutate(inhibition = as.integer(inhibition)) %>%
+  count(target, inhibition, name = "n") %>%
+  mutate(inhibition = factor(as.character(inhibition), levels = c("0", "1", "2", "3")))
+
+chi_target_tab  <- xtabs(n ~ target + inhibition, data = target_hits_stats)
+chi_target_test <- chisq.test(chi_target_tab, simulate.p.value = TRUE, B = 100000)
+
+chi_target_df <- (nrow(chi_target_tab) - 1) * (ncol(chi_target_tab) - 1)
+sprintf("Target test: X^2 = %.1f, df = %d, p < %.1e",
+        unname(chi_target_test$statistic), chi_target_df, chi_target_test$p.value)
+```
+
+### Stats: Chi-square by Genus
+
+```{r stats_chi_genus, include=FALSE}
+isolate_inhibition_for_chi <- isolate_inhibition %>%
+  mutate(inhibition = factor(as.character(inhibition), levels = c("0", "1", "2", "3")))
+
+chi_genus_tab  <- xtabs(count ~ genus + inhibition, data = isolate_inhibition_for_chi)
+chi_genus_test <- chisq.test(chi_genus_tab, simulate.p.value = TRUE, B = 100000)
+
+chi_genus_df <- (nrow(chi_genus_tab) - 1) * (ncol(chi_genus_tab) - 1)
+sprintf("Genus test: X^2 = %.1f, df = %d, p < %.1e",
+        unname(chi_genus_test$statistic), chi_genus_df, chi_genus_test$p.value)
+```
+
+### Stats: Fligner-Killeen on Z-Score
+
+```{r stats_fligner_global, include=FALSE}
+var_fligner_global <- fligner.test(z_overall ~ genus, data = total_inhibition_per_isolate)
+var_fligner_global
+```
+
+### Stats: Fligner-Killeen Pairwise + Letters (Holm)
+
+```{r stats_fligner_pairwise, include=FALSE}
+fligner_gs    <- levels(factor(total_inhibition_per_isolate$genus))
+fligner_pairs <- combn(fligner_gs, 2, simplify = FALSE)
+
+fligner_pairs_df <- do.call(rbind, lapply(fligner_pairs, function(g) {
+  d <- subset(total_inhibition_per_isolate, genus %in% g)
+  data.frame(g1 = g[1], g2 = g[2],
+             p  = fligner.test(z_overall ~ genus, data = d)$p.value)
+}))
+
+fligner_pairs_df$padj <- p.adjust(fligner_pairs_df$p, method = "BH")
+
+# named vector "g1-g2" for multcompView
+fligner_padj_vec <- fligner_pairs_df$padj
+names(fligner_padj_vec) <- paste(fligner_pairs_df$g1, fligner_pairs_df$g2, sep = "-")
+
+fligner_letters <- multcompView::multcompLetters(fligner_padj_vec, threshold = 0.05)
+fligner_letters_df <- data.frame(
+  genus   = names(fligner_letters$Letters),
+  letters = unname(fligner_letters$Letters),
+  row.names = NULL
+)
+```
+
+### Stats: Kruskal-Wallis on Z-Score
+
+```{r stats_kw_global, include=FALSE}
+kw_global_test <- kruskal.test(z_overall ~ genus, data = total_inhibition_per_isolate)
+kw_global_test
+```
+
+### Stats: Pairwise Wilcoxon (Holm) + Letters
+
+```{r stats_kw_pairwise_letters, include=FALSE}
+kw_pw_test <- pairwise.wilcox.test(
+  x      = total_inhibition_per_isolate$z_overall,
+  g      = total_inhibition_per_isolate$genus,
+  p.adjust.method = "BH",
+  exact  = FALSE,
+  na.action = na.omit
+)
+
+# convert the triangular adjusted p-value matrix to a named vector "g1-g2"
+kw_pmat <- kw_pw_test$p.value
+kw_idx  <- which(!is.na(kw_pmat), arr.ind = TRUE)
+kw_pvec <- kw_pmat[kw_idx]
+names(kw_pvec) <- paste(rownames(kw_pmat)[kw_idx[, "row"]],
+                        colnames(kw_pmat)[kw_idx[, "col"]],
+                        sep = "-")
+
+kw_letters <- multcompView::multcompLetters(kw_pvec, threshold = 0.05)
+
+# remap so "a" belongs to the first genus in x-axis order
+genus_order_kw <- levels(total_inhibition_per_isolate$genus)
+raw_kw   <- kw_letters$Letters[genus_order_kw]
+# build mapping from individual component letters (not whole patterns),
+# in the order they first appear across genera left-to-right
+chars_in_order <- unique(unlist(strsplit(raw_kw, "")))
+lmap_kw  <- setNames(letters[seq_along(chars_in_order)], chars_in_order)
+kw_letters_df <- data.frame(
+  genus   = genus_order_kw,
+  letters = sapply(raw_kw, function(l)
+    paste(sort(lmap_kw[strsplit(l, "")[[1]]]), collapse = "")),
+  row.names = NULL
+)
+```
+
+## Intrasubject Pseudomonas Strain Variability
+
+```{r pseudomonas_intrasubject_variability, include=FALSE}
+pseudomonas_variable_hids <- total_inhibition_per_isolate %>%
+  filter(grepl("Pseudomonas", genus, ignore.case = TRUE)) %>%
+  group_by(hid) %>%
+  filter(n() >= 2) %>%
+  summarize(z_spread = max(z_within_genus) - min(z_within_genus), .groups = "drop") %>%
+  filter(z_spread >= 2) %>%
+  pull(hid)
+
+pseudomonas_variable_isolates <- total_inhibition_per_isolate %>%
+  filter(grepl("Pseudomonas", genus, ignore.case = TRUE),
+         hid %in% pseudomonas_variable_hids) %>%
+  group_by(hid) %>%
+  summarize(
+    z_spread = max(z_within_genus) - min(z_within_genus),
+    isolates = paste(paste0(isolate, " (", round(z_within_genus, 2), ")")[order(-z_within_genus)], collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(z_spread))
+```
+
+## LC-MS/MS
+
+```{r fig6_S5B_data, include=FALSE}
+lcms_p_cutoff <- 0.01     # feature set: Kruskal-Wallis p <= this
+lcms_n_perm   <- 9999     # PERMANOVA permutations
+lcms_n_boot   <- 1000     # pvclust bootstrap replicates
+
+lcms_host_pal <- c(HID07 = "#8dd3c7", HID08 = "#fdb462", HID16 = "#bebada",
+                   HID17 = "#b3de69", HID23 = "#f0e04d")
+lcms_inh_pal  <- c(Yes = "#6c8197", No = "#c0cad5")
+lcms_val_col  <- circlize::colorRamp2(c(-2, 0, 2), c("#4575B4", "#FFFFFF", "#D73027"))
+
+# raw sample column -> isolate (strip run/rep tags; pad NB numbers to 4 digits,
+# which also repairs the NB01046 typo)
+lcms_norm_iso <- function(x) {
+  s <- sub("^X[0-9.]+_", "", x); s <- sub("_[A-Z]$", "", s)
+  ifelse(grepl("^NB", s), sprintf("NB%04d", as.integer(sub("^NB0*", "", s))), s)
+}
+lcms_first <- which(colnames(lcms_diff) == "postHoc") + 1
+lcms_scols <- colnames(lcms_diff)[lcms_first:ncol(lcms_diff)]
+lcms_ciso  <- lcms_norm_iso(lcms_scols)
+lcms_icols <- lcms_scols[lcms_ciso != "BHI"]
+lcms_iso   <- lcms_ciso[lcms_ciso != "BHI"]
+
+# significant features (raw intensities) + isolate means
+lcms_sig     <- which(lcms_diff$pvalue <= lcms_p_cutoff)
+lcms_raw     <- as.matrix(lcms_diff[lcms_sig, lcms_icols])
+rownames(lcms_raw) <- lcms_diff$name[lcms_sig]; colnames(lcms_raw) <- lcms_icols
+lcms_iso_raw <- t(apply(lcms_raw, 1, function(v) tapply(v, lcms_iso, mean)))
+
+# BHI blank-subtracted copy of the same features
+lcms_bcols <- lcms_scols[lcms_ciso == "BHI"]
+lcms_bmean <- rowMeans(as.matrix(lcms_diff[lcms_sig, lcms_bcols]))
+lcms_sub   <- pmax(lcms_raw - lcms_bmean, 0)
+
+lcms_samp_meta <- tibble(sample = lcms_icols, isolate = lcms_iso) %>%
+  left_join(lcms_meta, by = "isolate") %>% as.data.frame()
+rownames(lcms_samp_meta) <- lcms_samp_meta$sample
+lcms_iso_meta <- lcms_meta %>%
+  filter(isolate %in% colnames(lcms_iso_raw)) %>%
+  arrange(match(isolate, colnames(lcms_iso_raw))) %>% as.data.frame()
+
+# per-feature z-scored log2 isolate-mean matrix
+lcms_zscore <- function(m) { z <- t(scale(t(m))); z[!is.finite(z)] <- 0; z }
+lcms_matz   <- lcms_zscore(log2(lcms_iso_raw + 1))
+```
+
+## Figures
+
+```{r ggtheme, include=FALSE}
+gg_theme <- theme_classic() +
+  theme(
+    axis.text.y = element_text(color = "black", size = 14),
+    axis.title.y = element_text(color = "black", size = 18),
+    axis.text.x = element_text(color = "black", size = 16),
+    axis.title.x = element_text(color = "black", size = 18),
+    axis.ticks.y = element_line(color = "black", linewidth = 0.25),
+    axis.ticks.x = element_line(color = "black", linewidth = 0.25),
+    axis.line.x = element_blank(),
+    axis.line.y = element_blank(),
+    axis.text = element_text(size = 18),
+    strip.text = element_text(size = 18),
+    legend.text = element_text(size = 18),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.25),
+    plot.background = element_blank(),
+    legend.position = "none",
+    legend.title = element_blank()
+  )
+
+# Force the data panel to a fixed physical size; accepts ggplot or gtable
+fix_panel_size <- function(p, w = unit(3.129, "in"), h = unit(3.129, "in")) {
+  g <- if (inherits(p, "ggplot")) ggplotGrob(p) else p
+  idx <- which(g$layout$name == "panel")
+  for (i in idx) {
+    g$widths[g$layout$l[i]]  <- w
+    g$heights[g$layout$t[i]] <- h
+  }
+  g
+}
+```
+
+```{r fig1_shared, include=FALSE}
+fig1_theme <- theme_classic() +
+  theme(axis.text    = element_text(color = "black", size = 10),
+        axis.title   = element_text(color = "black", size = 12),
+        axis.line    = element_blank(),
+        panel.border = element_rect(fill = NA, color = "black", linewidth = 0.25),
+        plot.tag     = element_text(size = 12, face = "bold"))
+
+pathogen_palette <- c(
+  "Pseudomonas"      = "#e9f5a3",
+  "Stenotrophomonas" = "#4b86b8",
+  "Burkholderia"     = "#c54a53",
+  "Escherichia"      = "#e3754f",
+  "Achromobacter"    = "#911c43",
+  "Staphylococcus"   = "#7dc0a7",
+  "Haemophilus"      = "#b5dca9"
+)
+
+fig1_pathogen_order <- c("Pseudomonas", "Stenotrophomonas", "Burkholderia",
+                         "Escherichia", "Achromobacter", "Staphylococcus",
+                         "Haemophilus")
+pathogen_in_table <- fig1_pathogen_order[fig1_pathogen_order %in% metacommunity_genera]
+oro_in_table      <- sort(metacommunity_genera[!metacommunity_genera %in% cf_pathogens])
+fig1_genus_order  <- c(pathogen_in_table, oro_in_table)
+```
+
+### Figure 1A
+
+```{r fig_1A, include=FALSE}
+N_BOOT_1A <- 2000
+
+ra_wide_1A <- per_sample_ra %>%
+  filter(taxon %in% metacommunity_genera) %>%
+  dplyr::select(sample, taxon, ra) %>%
+  pivot_wider(names_from = taxon, values_from = ra, values_fill = 0) %>%
+  arrange(sample)
+ra_mat_1A <- as.matrix(dplyr::select(ra_wide_1A, -sample))
+n_samp_1A <- nrow(ra_mat_1A)
+
+prev_fn_1A  <- function(M) colSums(M >= 1)  / nrow(M) * 100
+dom_fn_1A   <- function(M) colSums(M >  50) / nrow(M) * 100
+bloom_fn_1A <- function(M) {
+  np <- colSums(M >= 1); nd <- colSums(M > 50)
+  ifelse(np == 0, NA_real_, nd / np * 100)
+}
+
+boot_arr_1A <- array(
+  NA_real_,
+  dim = c(N_BOOT_1A, ncol(ra_mat_1A), 3),
+  dimnames = list(NULL, colnames(ra_mat_1A),
+                  c("prev_1_pct", "dominant_pct", "bloom_given_prev"))
+)
+for (b in seq_len(N_BOOT_1A)) {
+  Mb <- ra_mat_1A[sample.int(n_samp_1A, n_samp_1A, replace = TRUE), , drop = FALSE]
+  boot_arr_1A[b, , "prev_1_pct"]       <- prev_fn_1A(Mb)
+  boot_arr_1A[b, , "dominant_pct"]     <- dom_fn_1A(Mb)
+  boot_arr_1A[b, , "bloom_given_prev"] <- bloom_fn_1A(Mb)
+}
+ci_lo_1A <- apply(boot_arr_1A, c(2, 3), quantile, probs = 0.025, na.rm = TRUE)
+ci_hi_1A <- apply(boot_arr_1A, c(2, 3), quantile, probs = 0.975, na.rm = TRUE)
+
+ci_long_1A <- bind_rows(
+  tibble(genus = rownames(ci_lo_1A), metric = "prev_1_pct",
+         lo = ci_lo_1A[, "prev_1_pct"], hi = ci_hi_1A[, "prev_1_pct"]),
+  tibble(genus = rownames(ci_lo_1A), metric = "dominant_pct",
+         lo = ci_lo_1A[, "dominant_pct"], hi = ci_hi_1A[, "dominant_pct"]),
+  tibble(genus = rownames(ci_lo_1A), metric = "bloom_given_prev",
+         lo = ci_lo_1A[, "bloom_given_prev"], hi = ci_hi_1A[, "bloom_given_prev"])
+)
+
+metric_cols <- c(
+  "Prevalence (\u22651% Relative Abundance)" = "#c0cad5",
+  "Dominance (>50% Relative Abundance)"      = "#6c8197",
+  "Bloom Rate (Dominance/Prevalence)"        = "#94a8bf"
+)
+
+plot_df_1A <- metacommunity_table %>%
+  dplyr::select(genus, prev_1_pct, dominant_pct, bloom_given_prev) %>%
+  pivot_longer(cols = c(prev_1_pct, dominant_pct, bloom_given_prev),
+               names_to = "metric", values_to = "value") %>%
+  left_join(ci_long_1A, by = c("genus", "metric")) %>%
+  mutate(
+    metric = recode(metric,
+                    prev_1_pct       = "Prevalence (\u22651% Relative Abundance)",
+                    dominant_pct     = "Dominance (>50% Relative Abundance)",
+                    bloom_given_prev = "Bloom Rate (Dominance/Prevalence)"),
+    metric = factor(metric, levels = c("Prevalence (\u22651% Relative Abundance)",
+                                       "Dominance (>50% Relative Abundance)",
+                                       "Bloom Rate (Dominance/Prevalence)")),
+    genus  = factor(genus, levels = fig1_genus_order)
+  )
+
+genus_labels_1A <- setNames(
+  sapply(fig1_genus_order, function(g) {
+    if (g %in% cf_pathogens) {
+      paste0("<i><span style='color:#E69F00; font-weight:bold;'>", g, "</span></i>")
+    } else {
+      paste0("<i>", g, "</i>")
+    }
+  }),
+  fig1_genus_order
+)
+
+panel_1a <- ggplot(plot_df_1A, aes(x = genus, y = value, fill = metric)) +
+  geom_hline(yintercept = c(20, 40, 60, 80),
+             color = "gray85", linewidth = 0.3) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75,
+           color = "black", linewidth = 0.2) +
+  geom_errorbar(aes(ymin = lo, ymax = hi),
+                position = position_dodge(width = 0.8),
+                width = 0.3, linewidth = 0.3, color = "black", na.rm = TRUE) +
+  scale_fill_manual(values = metric_cols, name = NULL) +
+  scale_x_discrete(labels = genus_labels_1A) +
+  scale_y_continuous(breaks = c(0, 20, 40, 60, 80),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = NULL, y = "Percent (%)") +
+  fig1_theme +
+  theme(axis.text.x          = ggtext::element_markdown(angle = 45, hjust = 1, size = 10),
+        legend.position      = c(0.005, 0.97),
+        legend.justification  = c(0, 1),
+        legend.background    = element_rect(fill = "white", color = "black",
+                                              linewidth = 0.25),
+        legend.margin        = margin(2, 4, 2, 4),
+        legend.text          = element_text(size = 10),
+        legend.key.size      = unit(0.4, "cm"))
+```
+
+### Figure 1B
+
+```{r fig_1B, include=FALSE}
+fev1_bin_order <- c("Mild", "Moderate", "Severe", "Very Severe")
+fev1_bin_cols <- c("Mild" = "#4575B4", "Moderate" = "#ABD9E9",
+                   "Severe" = "#FDAE61", "Very Severe" = "#D73027")
+fev1_bin_labels_num <- c("Mild" = paste0("\u2265", "80"), "Moderate" = "50-79",
+                         "Severe" = "30-49", "Very Severe" = "<30")
+
+alpha_genus <- alpha_adj %>%
+  mutate(FEV1_bin = factor(FEV1_bin, levels = fev1_bin_order))
+
+pw_genus <- pairwise.wilcox.test(alpha_genus$shannon_adj, alpha_genus$FEV1_bin,
+                                  p.adjust.method = "BH", exact = FALSE)
+pw_pmat <- pw_genus$p.value
+pw_idx  <- which(!is.na(pw_pmat), arr.ind = TRUE)
+pw_pvec <- pw_pmat[pw_idx]
+names(pw_pvec) <- paste(rownames(pw_pmat)[pw_idx[, "row"]],
+                        colnames(pw_pmat)[pw_idx[, "col"]], sep = "-")
+alpha_letters <- multcompLetters(pw_pvec, threshold = 0.05)
+raw_letters <- alpha_letters$Letters[fev1_bin_order]
+unique_raw  <- unique(raw_letters)
+letter_map  <- setNames(letters[seq_along(unique_raw)], unique_raw)
+alpha_letters_df <- data.frame(
+  FEV1_bin = fev1_bin_order,
+  letter   = unname(sapply(raw_letters, function(l) {
+    paste(sort(letter_map[strsplit(l, "")[[1]]]), collapse = "")
+  }))
+)
+
+letter_pos <- alpha_genus %>%
+  group_by(FEV1_bin) %>%
+  summarize(y = max(shannon_adj, na.rm = TRUE) + 0.15, .groups = "drop") %>%
+  left_join(alpha_letters_df, by = "FEV1_bin")
+
+n_per_bin <- alpha_genus %>%
+  count(FEV1_bin) %>%
+  mutate(label = paste0(fev1_bin_labels_num[as.character(FEV1_bin)],
+                        "\n(N=", n, ")"))
+bin_labels <- setNames(n_per_bin$label, n_per_bin$FEV1_bin)
+
+panel_2a_outliers <- alpha_genus %>%
+  group_by(FEV1_bin) %>%
+  mutate(.q1 = quantile(shannon_adj, 0.25, na.rm = TRUE),
+         .q3 = quantile(shannon_adj, 0.75, na.rm = TRUE),
+         .iqr = .q3 - .q1) %>%
+  filter(shannon_adj < .q1 - 1.5 * .iqr | shannon_adj > .q3 + 1.5 * .iqr) %>%
+  ungroup()
+
+panel_2a <- ggplot(alpha_genus, aes(x = shannon_adj, y = FEV1_bin, fill = FEV1_bin)) +
+  geom_boxplot(alpha = 0.7, notch = TRUE, outlier.shape = NA) +
+  geom_point(data = panel_2a_outliers, aes(fill = FEV1_bin),
+             shape = 21, color = "black", stroke = 0.2,
+             size = 1, alpha = 0.85) +
+  geom_text(data = letter_pos, aes(x = y, y = FEV1_bin, label = letter),
+            inherit.aes = FALSE, size = 3) +
+  scale_fill_manual(values = fev1_bin_cols, guide = "none") +
+  scale_y_discrete(limits = rev(fev1_bin_order), labels = bin_labels) +
+  labs(y = expression(Lung~Function~"("*FEV[1]~pp*")"),
+       x = expression(Diversity~"("*italic(H)*"'"[Adj]*")")) +
+  fig1_theme
+```
+
+### Figure 1C
+
+```{r fig_1C, include=FALSE}
+bp_plot_df <- bp_adj_df %>%
+  mutate(dom_type = factor(if_else(dominant_pathogen == "Other",
+                                   "Oropharyngeal", "Pathogen"),
+                           levels = c("Pathogen", "Oropharyngeal")))
+
+dom_type_counts <- bp_plot_df %>% count(dom_type)
+dom_type_labels <- setNames(
+  vapply(levels(bp_plot_df$dom_type), function(g) {
+    n <- dom_type_counts$n[dom_type_counts$dom_type == g]
+    if (length(n) == 0) n <- 0
+    paste0(g, " (N=", scales::comma(n), ")")
+  }, character(1)),
+  levels(bp_plot_df$dom_type)
+)
+dom_type_cols <- c("Pathogen" = "#E69F00", "Oropharyngeal" = "gray60")
+
+panel_2b <- ggplot(bp_plot_df, aes(x = bp_dom, y = FEV1_adj)) +
+  geom_line(data = boot_lines_bp, aes(x = x, y = y, group = boot),
+            color = "lightpink", alpha = 0.15) +
+  geom_vline(xintercept = 0.5, linetype = "dashed",
+             color = "gray40", linewidth = 0.5) +
+  geom_jitter(aes(color = dom_type),
+              width = 0.005, alpha = 0.4, size = 1.5) +
+  geom_smooth(method = "lm", color = "#D73027", se = FALSE, linewidth = 1.1) +
+  scale_color_manual(values = dom_type_cols, labels = dom_type_labels) +
+  scale_x_continuous(breaks = seq(0.2, 1.0, 0.2)) +
+  scale_y_continuous() +
+  labs(x = "Dominance (BP)",
+       y = expression(Lung~Function~"("*FEV[1]~pp[Adj]*")")) +
+  fig1_theme +
+  theme(legend.position    = "bottom",
+        legend.text        = element_text(size = 9),
+        legend.title       = element_blank(),
+        legend.key.height  = unit(0.35, "cm"),
+        legend.spacing.y   = unit(0, "cm")) +
+  guides(color = guide_legend(nrow = 1, reverse = TRUE,
+                               override.aes = list(alpha = 1, size = 1.5)))
+```
+
+### Figure 1
+
+```{r fig_1, include=FALSE}
+fig2_panel_size <- grid::unit(3.2, "in")
+
+pad_to_height <- function(g, target_h_in) {
+  cur_h <- sum(grid::convertHeight(g$heights, "in", valueOnly = TRUE))
+  if (cur_h < target_h_in) {
+    g <- gtable::gtable_add_rows(g, grid::unit(target_h_in - cur_h, "in"))
+  }
+  g
+}
+
+# Extract 1C legend
+leg_1c <- cowplot::get_legend(panel_2b)
+
+fix_panel_size_grob <- function(g, w, h) {
+  panels <- g$layout[g$layout$name == "panel", ]
+  l_idx <- panels$l[1]; r_idx <- panels$r[1]
+  t_idx <- panels$t[1]; b_idx <- panels$b[1]
+  g$widths[l_idx:r_idx]  <- w
+  g$heights[t_idx:b_idx] <- h
+  g
+}
+
+panel_2a_gg <- panel_2a + labs(tag = "B") +
+  theme(legend.position = "none", aspect.ratio = NULL,
+        plot.tag = element_text(size = 12, face = "bold"))
+
+panel_2b_gg <- panel_2b + labs(tag = "C") +
+  theme(legend.position = "none", aspect.ratio = NULL,
+        plot.tag = element_text(size = 12, face = "bold"))
+
+panel_1a_gg <- panel_1a + labs(tag = "A") +
+  theme(plot.tag    = element_text(size = 12, face = "bold"),
+        plot.margin = margin(b = 30, unit = "pt"))
+
+al_lr        <- cowplot::align_plots(panel_1a_gg, panel_2a_gg, panel_2b_gg,
+                                      align = "v", axis = "lr")
+panel_1a_al  <- al_lr[[1]]
+
+panel_1b_sized <- fix_panel_size_grob(al_lr[[2]], fig2_panel_size, fig2_panel_size)
+panel_1c_sized <- fix_panel_size_grob(al_lr[[3]], fig2_panel_size, fig2_panel_size)
+
+bc_heights      <- c(sum(grid::convertHeight(panel_1b_sized$heights, "in", valueOnly = TRUE)),
+                     sum(grid::convertHeight(panel_1c_sized$heights, "in", valueOnly = TRUE)))
+bc_hmax         <- max(bc_heights)
+panel_1b_padded <- pad_to_height(panel_1b_sized, bc_hmax)
+panel_1c_padded <- pad_to_height(panel_1c_sized, bc_hmax)
+
+bc_top  <- cowplot::plot_grid(panel_1b_padded, panel_1c_padded, ncol = 2)
+bc_legs <- cowplot::plot_grid(NULL, leg_1c, ncol = 2)
+bc_row  <- cowplot::plot_grid(bc_top, bc_legs, ncol = 1, rel_heights = c(1, 0.18))
+
+figure_1 <- cowplot::plot_grid(panel_1a_al, bc_row, ncol = 1, rel_heights = c(1, 1))
+
+dir.create("figures", showWarnings = FALSE)
+ggsave("figures/figure_1.pdf", figure_1, units = "in", width = 9, height = 8, device = cairo_pdf)
+```
+
+### Figure 2A
+
+```{r fig_2A, include=FALSE}
+age_levels  <- age_label_map[age_levels_raw]
+color_vals <- setNames(c("#E69F00", "#CC79A7", "#4575B4", "#56B4E9", "gray60"), age_levels)
+
+plot_df_adj <- data.frame(
+  n_taxa    = n_interacting_adj,
+  fev1_adj  = fev1_adjusted,
+  age_group = factor(fev1_age_adj, levels = age_levels))
+
+panel_3a <- ggplot(plot_df_adj, aes(x = n_taxa, y = fev1_adj)) +
+  geom_line(data = boot_lines_adj, aes(x = x, y = y, group = boot),
+            color = "lightblue", alpha = 0.15) +
+  geom_jitter(aes(color = age_group), width = 0.4, alpha = 0.4, size = 1.5) +
+  geom_smooth(method = "lm", color = "#4575B4", se = FALSE, linewidth = 1.1) +
+  scale_color_manual(values = color_vals, name = "Age") +
+  scale_y_continuous() +
+  labs(x = "Number of Interacting Genera",
+       y = expression(Lung~Function~"("*FEV[1]~pp[Adj]*")"),
+       tag = "A") +
+  gg_theme +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, linewidth = 0.25),
+        axis.text.x  = element_text(size = 10, color = "black"),
+        axis.text.y  = element_text(size = 10, color = "black"),
+        axis.title.x = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        legend.position = "bottom",
+        legend.text  = element_text(size = 10),
+        legend.title = element_text(size = 10, face = "bold"),
+        plot.tag = element_text(size = 12, face = "bold")) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE))
+```
+
+### Figure 2B
+
+```{r fig_2B, include=FALSE}
+bx_mat   <- matrix(0, n_genera, n_genera, dimnames = list(genera, genera))
+pval_mat <- matrix(1, n_genera, n_genera, dimnames = list(genera, genera))
+
+for (i in seq_len(nrow(pairwise_results))) {
+  g1 <- pairwise_results$genus1[i]
+  g2 <- pairwise_results$genus2[i]
+  bx_mat[g1, g2]  <- bx_mat[g2, g1]  <- pairwise_results$bx[i]
+  pval_mat[g1, g2] <- pval_mat[g2, g1] <- pairwise_results$pval[i]
+}
+
+pathogen_order  <- c("Pseudomonas", "Stenotrophomonas", "Burkholderia",
+                     "Escherichia", "Achromobacter", "Staphylococcus", "Haemophilus")
+pathogen_genera <- pathogen_order[pathogen_order %in% genera]
+anaerobe_genera <- sort(genera[!genera %in% cf_pathogens])
+genus_order     <- c(pathogen_genera, anaerobe_genera)
+
+isolate_genera  <- unique(cf_isolates$genus)
+target_genera   <- unique(sub(" .*", "", bioassay_data$target))
+bioassay_genera <- unique(c(isolate_genera, target_genera))
+
+axis_colors <- ifelse(genus_order %in% cf_pathogens, "#E69F00", "#000000")
+axis_labels  <- sapply(seq_along(genus_order), function(i) {
+  g <- genus_order[i]; col <- axis_colors[i]
+  if (g %in% bioassay_genera)
+    paste0("<span style='color:", col, "'><b><i>", g, "</i></b></span>")
+  else
+    paste0("<span style='color:", col, "'><i>", g, "</i></span>")
+})
+names(axis_labels) <- genus_order
+
+bubble_df <- pairwise_results %>%
+  mutate(direction = ifelse(bx > 0, "Positive", "Negative"),
+         genus1 = factor(genus1, levels = genus_order),
+         genus2 = factor(genus2, levels = genus_order)) %>%
+  filter(significant) %>%
+  mutate(r = as.integer(genus1), c = as.integer(genus2),
+         row_genus = ifelse(r > c, as.character(genus1), as.character(genus2)),
+         col_genus = ifelse(r > c, as.character(genus2), as.character(genus1))) %>%
+  mutate(row_genus = factor(row_genus, levels = genus_order),
+         col_genus = factor(col_genus, levels = genus_order)) %>%
+  dplyr::select(row_genus, col_genus, bx, direction)
+
+n_go    <- length(genus_order)
+s       <- seq_len(n_go - 1)
+h_lines <- data.frame(y = s, xmin = 0.5, xmax = (n_go - s) + 1.0)
+v_lines <- data.frame(x = s, ymin = 0.5, ymax = (n_go - s) + 1.0)
+
+panel_3b <- ggplot(bubble_df, aes(x = col_genus, y = row_genus)) +
+  geom_segment(data = h_lines, aes(x = xmin, xend = xmax, y = y, yend = y),
+               color = "gray80", linewidth = 0.15, inherit.aes = FALSE) +
+  geom_segment(data = v_lines, aes(x = x, xend = x, y = ymin, yend = ymax),
+               color = "gray80", linewidth = 0.15, inherit.aes = FALSE) +
+  geom_point(aes(size = abs(bx), fill = direction), shape = 21,
+             color = "black", stroke = 0.3) +
+  scale_fill_manual(values = c("Negative" = "#D73027", "Positive" = "#4575B4"),
+                    name = "Association") +
+  scale_size_continuous(range = c(0.75, 5.25), name = "Coefficient (|b|)",
+                        breaks = c(0.05, 0.1, 0.5, 0.75),
+                        labels = c("0.05", "0.10", "0.50", "0.75")) +
+  scale_x_discrete(limits = genus_order[-length(genus_order)],
+                   labels = axis_labels, drop = FALSE) +
+  scale_y_discrete(limits = rev(genus_order[-1]),
+                   labels = axis_labels[rev(genus_order[-1])], drop = FALSE) +
+  labs(x = NULL, y = NULL, tag = "B") +
+  gg_theme +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, linewidth = 0.25),
+        axis.text.x  = ggtext::element_markdown(angle = 45, hjust = 1, size = 10),
+        axis.text.y  = ggtext::element_markdown(size = 10),
+        axis.title.x = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        legend.position = "bottom",
+        legend.text  = element_text(size = 10),
+        legend.title = element_text(size = 10, face = "bold"),
+        legend.box = "vertical",
+        panel.grid.major = element_blank(),
+        plot.tag = element_text(size = 12, face = "bold")) +
+  guides(size = guide_legend(nrow = 2, byrow = TRUE))
+```
+
+### Figure 2B inset
+
+```{r fig_2B_upset_inset, include=FALSE}
+sig_pairs_upset <- pairwise_results %>%
+  filter(significant) %>%
+  mutate(
+    g1_path       = genus1 %in% cf_pathogens,
+    g2_path       = genus2 %in% cf_pathogens,
+    direction     = factor(ifelse(bx > 0, "Positive", "Negative"),
+                           levels = c("Positive", "Negative")),
+    Pathogen      = g1_path | g2_path,
+    Oropharyngeal = !g1_path | !g2_path
+  )
+
+direction_cols_upset <- c("Negative" = "#D73027", "Positive" = "#4575B4")
+pathogen_gold_upset  <- "#E69F00"
+
+inset_overrides_2b <- theme(
+  axis.text.y  = element_text(color = "black", size = 10),
+  axis.title.y = element_text(color = "black", size = 10),
+  axis.text.x  = element_text(color = "black", size = 10),
+  axis.title.x = element_text(color = "black", size = 10),
+  axis.text    = element_text(size = 10),
+  strip.text   = element_text(size = 10),
+  legend.position = "none",
+  plot.background = element_rect(fill = "white", color = NA),
+  plot.margin     = margin(2, 3, 2, 2)
+)
+
+upset_inset_2b <- upset(
+  data         = as.data.frame(sig_pairs_upset),
+  intersect    = c("Oropharyngeal", "Pathogen"),
+  name         = NULL,
+  sort_sets          = FALSE,
+  sort_intersections = FALSE,
+  intersections = list(
+    "Pathogen",
+    c("Pathogen", "Oropharyngeal"),
+    "Oropharyngeal"
+  ),
+  stripes      = upset_stripes(colors = c("white", "white")),
+  width_ratio  = 0.22,
+  height_ratio = 0.55,
+  queries = list(
+    upset_query(set   = "Pathogen",
+                fill  = pathogen_gold_upset,
+                color = pathogen_gold_upset,
+                only_components = c("intersections_matrix"))
+  ),
+  base_annotations = list(
+    "# of Pairs" = intersection_size(
+      counts  = FALSE,
+      mapping = aes(fill = direction),
+      width   = 0.6
+    ) +
+      scale_fill_manual(values = direction_cols_upset, guide = "none") +
+      gg_theme + inset_overrides_2b +
+      theme(panel.border = element_blank(),
+            axis.line.y  = element_line(color = "black", linewidth = 0.25),
+            axis.line.x  = element_line(color = "black", linewidth = 0.25),
+            axis.text.x  = element_blank(),
+            axis.title.x = element_blank(),
+            axis.ticks.x = element_blank())
+  ),
+  set_sizes = (
+    upset_set_size(geom = geom_bar(width = 0.6)) +
+      gg_theme + inset_overrides_2b +
+      theme(panel.border = element_blank(),
+            axis.line.x  = element_line(color = "black", linewidth = 0.25),
+            axis.text.x  = element_text(
+              color = c("black", "transparent", "black",
+                        "transparent", "black"),
+              angle = 45, hjust = 1, size = 10
+            ),
+            axis.title.x = element_blank(),
+            axis.title.y = element_blank(),
+            axis.text.y  = element_blank(),
+            axis.ticks.y = element_blank())
+  ),
+  matrix = intersection_matrix(geom = geom_point(size = 2.8)),
+  themes = upset_modify_themes(list(
+    "intersections_matrix" =
+      gg_theme + inset_overrides_2b +
+      theme(axis.text.y  = element_blank(),
+            axis.text.x  = element_blank(),
+            axis.title.x = element_blank(),
+            axis.title.y = element_blank(),
+            axis.ticks   = element_blank(),
+            panel.border = element_blank(),
+            panel.background = element_blank())
+  ))
+)
+
+dir.create("figures", showWarnings = FALSE)
+ggsave("figures/figure_2B_upset_inset.pdf", upset_inset_2b,
+       width = 2.2, height = 1.95, device = cairo_pdf)
+```
+
+### Figure 2
+
+```{r fig_2, include=FALSE}
+fig2_panel_size <- grid::unit(3.2, "in")
+
+leg_3a         <- cowplot::get_legend(panel_3a)
+leg_3b         <- cowplot::get_legend(panel_3b)
+panel_3a_noleg <- egg::set_panel_size(panel_3a +
+                                        theme(legend.position = "none",
+                                              aspect.ratio = NULL),
+                                      width = fig2_panel_size,
+                                      height = fig2_panel_size)
+panel_3b_noleg <- egg::set_panel_size(panel_3b +
+                                        theme(legend.position = "none",
+                                              aspect.ratio = NULL),
+                                      width = fig2_panel_size,
+                                      height = fig2_panel_size)
+pad_to_height <- function(g, target_h_in) {
+  cur_h <- sum(grid::convertHeight(g$heights, "in", valueOnly = TRUE))
+  if (cur_h < target_h_in) {
+    g <- gtable::gtable_add_rows(g, grid::unit(target_h_in - cur_h, "in"))
+  }
+  g
+}
+fig2_heights <- c(
+  sum(grid::convertHeight(panel_3a_noleg$heights, "in", valueOnly = TRUE)),
+  sum(grid::convertHeight(panel_3b_noleg$heights, "in", valueOnly = TRUE))
+)
+fig2_hmax      <- max(fig2_heights)
+panel_3a_noleg <- pad_to_height(panel_3a_noleg, fig2_hmax)
+panel_3b_noleg <- pad_to_height(panel_3b_noleg, fig2_hmax)
+
+top_row  <- cowplot::plot_grid(panel_3a_noleg, panel_3b_noleg, ncol = 2)
+leg_row  <- cowplot::plot_grid(leg_3a, leg_3b, ncol = 2)
+figure_2 <- cowplot::plot_grid(top_row, leg_row, ncol = 1, rel_heights = c(1, 0.2))
+ggsave("figures/figure_2.pdf", figure_2, width = 10, height = 7, device = cairo_pdf)
+```
+
+### Figure 3B
+
+```{r fig_3B_donut, include=FALSE}
+figure_4b <- ggplot(inhibition_counts, aes(ymax = ymax, ymin = ymin,
+                                            xmax = 4, xmin = 3,
+                                            fill = inhibition)) +
+  geom_rect() +
+  coord_polar(theta = "y") +
+  xlim(c(2, 4)) +
+  theme_void() +
+  theme(legend.position = "none") +
+  scale_fill_manual(
+    values = c("0" = "#D9D9D9", "1" = "#9ECAE1",
+               "2" = "#4292C6", "3" = "#08519C"),
+    name   = "ZOI Range (cm)",
+    labels = c("0", "0–1", "1–2", ">2")
+  ) +
+  annotate("text", x = 2, y = 0, label = paste("N =", formatted_total),
+           size = 3, fontface = "bold", hjust = 0.5, vjust = 0.5)
+```
+
+### Figure 3C
+
+```{r fig_3C, include=FALSE}
+cf_path_targets <- c("*A. xylosoxidans*", "*B. cenocepacia*", "*B. cepacia*",
+                     "*P. aeruginosa*", "*S. aureus*")
+
+target_label_map <- setNames(
+  sapply(levels(target_hits$target), function(t) {
+    clean <- gsub("^\\*|\\*$", "", t)
+    if (t %in% cf_path_targets) {
+      paste0("<span style='color:#E69F00; font-weight:bold; font-style:italic'>",
+             clean, "</span>")
+    } else {
+      paste0("<i>", clean, "</i>")
+    }
+  }),
+  levels(target_hits$target)
+)
+
+n_labels_target <- target_hits %>%
+  group_by(target) %>%
+  summarize(n_total = first(n_total), hit_rate = first(hit_rate), .groups = "drop")
+
+target_totals <- target_hits %>%
+  group_by(target) %>%
+  summarize(total_prop = sum(prop), .groups = "drop")
+
+panel_3c <- ggplot(target_hits, aes(x = target, y = prop,
+                                     fill = factor(inhibition, levels = 0:3))) +
+  gg_theme +
+  geom_col(position = position_stack(reverse = TRUE)) +
+  geom_col(data = target_totals, aes(x = target, y = total_prop),
+           fill = NA, color = "black", linewidth = 0.2, inherit.aes = FALSE) +
+  geom_text(
+    data = n_labels_target,
+    aes(x = target, y = hit_rate, label = paste0("N=", scales::comma(n_total))),
+    inherit.aes = FALSE,
+    angle = 45, hjust = 0, vjust = -0.4, size = 2.8
+  ) +
+  scale_fill_manual(
+    values = c("0" = "#D9D9D9", "1" = "#9ECAE1", "2" = "#4292C6", "3" = "#08519C"),
+    name   = "ZOI Range (cm)",
+    breaks = c("0", "1", "2", "3"),
+    labels = c("0 cm", "0–1 cm", "1–2 cm", ">2 cm"),
+    limits = c("0", "1", "2", "3"),
+    drop   = FALSE
+  ) +
+  scale_x_discrete(labels = target_label_map) +
+  scale_y_continuous(breaks = seq(0, 60, by = 10),
+                     limits = c(0, NA),
+                     expand = expansion(mult = c(0, 0.22))) +
+  theme(axis.text.x     = ggtext::element_markdown(angle = 45, hjust = 1, size = 12),
+        axis.text.y     = element_text(color = "black", size = 10),
+        axis.title.x    = element_text(color = "black", size = 12),
+        axis.title.y    = element_text(color = "black", size = 12),
+        legend.position = "bottom",
+        legend.text     = element_text(size = 9),
+        legend.title    = element_text(size = 10)) +
+  guides(fill = guide_legend(nrow = 1,
+                             override.aes = list(color = "black", linewidth = 0.2))) +
+  ylab("Inhibition Rate (%)") +
+  xlab("Target")
+```
+
+### Figure 3
+
+```{r fig_3, include=FALSE}
+# Placeholder for 3A — same display size as 3B (donut)
+panel_3a_placeholder <- ggplot() +
+  theme_void() +
+  theme(panel.background = element_rect(fill = "white",
+                                        color = "gray80",
+                                        linewidth = 0.3)) +
+  annotate("text", x = 0.5, y = 0.5, label = "3A placeholder",
+           size = 3, color = "gray50")
+
+# Build the shared legend from a dummy plot so all 4 ZOI categories
+leg_3_data <- data.frame(
+  x = 1:4, y = 1,
+  inhibition = factor(c("0", "1", "2", "3"), levels = c("0", "1", "2", "3"))
+)
+leg_3_dummy <- ggplot(leg_3_data, aes(x = x, y = y, fill = inhibition)) +
+  geom_col(color = "black", linewidth = 0.2) +
+  scale_fill_manual(
+    values = c("0" = "#D9D9D9", "1" = "#9ECAE1", "2" = "#4292C6", "3" = "#08519C"),
+    name   = "ZOI Range (cm)",
+    breaks = c("0", "1", "2", "3"),
+    labels = c("0 cm", "0\u20131 cm", "1\u20132 cm", ">2 cm"),
+    drop   = FALSE
+  ) +
+  guides(fill = guide_legend(nrow = 1,
+                             override.aes = list(color = "black", linewidth = 0.2))) +
+  theme(legend.position = "bottom",
+        legend.text     = element_text(size = 9),
+        legend.title    = element_text(size = 10))
+leg_3 <- cowplot::get_legend(leg_3_dummy)
+
+top_row_3 <- cowplot::plot_grid(
+  panel_3a_placeholder + labs(tag = "A") +
+    theme(plot.tag = element_text(size = 12, face = "bold")),
+  figure_4b + labs(tag = "B") +
+    theme(plot.tag = element_text(size = 12, face = "bold")),
+  ncol = 2
+)
+panel_3c_grob <- ggplotGrob(
+  panel_3c + labs(tag = "C") +
+    theme(plot.tag = element_text(size = 12, face = "bold"),
+          legend.position = "none")
+)
+panel_3c_sized <- fix_panel_size_grob(panel_3c_grob,
+                                      grid::unit(14.676, "cm"),
+                                      grid::unit(7.897,  "cm"))
+
+bottom_row_3 <- cowplot::plot_grid(panel_3c_sized, ncol = 1)
+
+figure_3 <- cowplot::plot_grid(top_row_3, bottom_row_3, leg_3,
+                               ncol = 1, rel_heights = c(1, 1.2, 0.12))
+
+ggsave("figures/figure_3.pdf", figure_3, units = "in",
+       width = 8, height = 9, device = cairo_pdf)
+```
+
+### Figure 4A
+
+```{r fig_4A, include=FALSE}
+fig5_lead   <- c("*Pseudomonas*", "*Stenotrophomonas*", "*Escherichia*", "*Staphylococcus*")
+fig5_others <- setdiff(unique(as.character(isolate_inhibition$genus)), fig5_lead)
+fig5_order  <- c(fig5_lead, fig5_others)
+
+isolate_inhibition_plot <- isolate_inhibition %>%
+  mutate(genus = factor(as.character(genus), levels = fig5_order))
+
+isolate_inhibition_figure <- ggplot(isolate_inhibition_plot, aes(x = genus, y = percent, fill = inhibition)) +
+  geom_col(position = position_stack(reverse = TRUE)) +
+  geom_col(
+    data = isolate_inhibition_plot %>%
+      group_by(genus) %>% summarize(total_pct = sum(percent), .groups = "drop"),
+    aes(x = genus, y = total_pct),
+    fill = NA, color = "black", linewidth = 0.2, inherit.aes = FALSE) +
+  gg_theme +
+  scale_fill_manual(
+    values = c("0" = "#D9D9D9", "1" = "#9ECAE1", "2" = "#4292C6", "3" = "#08519C"),
+    name   = "ZOI Range (cm)",
+    breaks = c("0", "1", "2", "3"),
+    labels = c("0 cm", "0-1 cm", "1-2 cm", ">2 cm"),
+    limits = c("0", "1", "2", "3"),
+    drop   = FALSE
+  ) +
+  scale_x_discrete(labels = function(x) {
+    m <- isolate_inhibition_plot %>% distinct(genus, N_isolates) %>%
+      mutate(
+        is_path = sapply(as.character(genus), function(g) any(sapply(cf_pathogens, grepl, x = g))),
+        label   = ifelse(
+          is_path,
+          paste0("<span style='color:#E69F00'>", genus, "<br/>(n=", N_isolates, ")</span>"),
+          paste0(genus, "<br/>(n=", N_isolates, ")")
+        )
+      )
+    setNames(m$label, m$genus)[x]
+  }) +
+  geom_text(
+    data = isolate_inhibition_plot %>% group_by(genus) %>% summarize(N_interactions = sum(count), .groups = "drop"),
+    aes(x = genus, y = 1.06, label = paste0("N=", scales::comma(N_interactions))),
+    inherit.aes = FALSE,
+    angle = 45,
+    vjust = -0.4,
+    size  = 2.8
+  ) +
+  scale_y_continuous(
+    breaks  = seq(0, 1, by = 0.2),
+    labels  = scales::number_format(accuracy = 1, scale = 100),
+    limits  = c(0, 1.18),
+    expand  = expansion(mult = c(0, 0.02))
+  ) +
+  xlab(NULL) +
+  ylab("ZOI Category (%)") +
+  theme(
+    axis.text.x  = ggtext::element_markdown(angle = 45, hjust = 1, size = 12, lineheight = 1.0),
+    axis.text.y  = element_text(color = "black", size = 10),
+    axis.title.x = element_text(color = "black", size = 12),
+    axis.title.y = element_text(color = "black", size = 12),
+    legend.position = "none"
+  )
+
+leg_5a <- cowplot::get_legend(
+  isolate_inhibition_figure + theme(legend.position = "bottom",
+                                     legend.text  = element_text(size = 9),
+                                     legend.title = element_text(size = 10))
+)
+```
+
+### Figure 4B
+
+```{r fig_4B, include=FALSE}
+total_inhibition_per_isolate <- total_inhibition_per_isolate %>%
+  mutate(genus = factor(as.character(genus), levels = fig5_order))
+
+chi_pairs_5b <- combn(fig5_order, 2, simplify = FALSE)
+chi_pairs_5b_df <- do.call(rbind, lapply(chi_pairs_5b, function(g) {
+  d <- isolate_inhibition_for_chi %>%
+    filter(genus %in% g) %>%
+    mutate(genus = droplevels(factor(genus)))
+  tab <- xtabs(count ~ genus + inhibition, data = d)
+  data.frame(g1 = g[1], g2 = g[2],
+             p = suppressWarnings(
+               chisq.test(tab, simulate.p.value = TRUE, B = 10000)$p.value))
+}))
+chi_pairs_5b_df$padj <- p.adjust(chi_pairs_5b_df$p, method = "BH")
+
+chi_padj_vec <- chi_pairs_5b_df$padj
+names(chi_padj_vec) <- paste(chi_pairs_5b_df$g1, chi_pairs_5b_df$g2, sep = "-")
+chi_letters_obj <- multcompLetters(chi_padj_vec, threshold = 0.05)
+
+raw_chi    <- chi_letters_obj$Letters[fig5_order]
+chars_chi  <- unique(unlist(strsplit(raw_chi, "")))
+lmap_chi   <- setNames(letters[seq_along(chars_chi)], chars_chi)
+inh_letters <- sapply(raw_chi, function(l)
+  paste(sort(lmap_chi[strsplit(l, "")[[1]]]), collapse = ""))
+
+raw_fl     <- setNames(fligner_letters_df$letters, fligner_letters_df$genus)[fig5_order]
+chars_fl   <- unique(unlist(strsplit(raw_fl, "")))
+lmap_fl    <- setNames(letters[seq_along(chars_fl)], chars_fl)
+disp_letters <- sapply(raw_fl, function(l)
+  paste(sort(lmap_fl[strsplit(l, "")[[1]]]), collapse = ""))
+
+kw_letters_df <- data.frame(
+  genus   = fig5_order,
+  letters = paste0(inh_letters, "/", disp_letters),
+  row.names = NULL
+)
+
+n_lab <- total_inhibition_per_isolate %>%
+  count(genus, name = "n") %>%
+  mutate(
+    is_path = sapply(as.character(genus), function(g) any(sapply(cf_pathogens, grepl, x = g))),
+    label   = ifelse(
+      is_path,
+      paste0("<span style='color:#E69F00'>", genus, "<br/>(n=", n, ")</span>"),
+      paste0(genus, "<br/>(n=", n, ")")
+    )
+  )
+
+lab_map <- setNames(n_lab$label, n_lab$genus)
+
+pos <- aggregate(z_overall ~ genus, data = total_inhibition_per_isolate, FUN = max)
+pos$y <- pos$z_overall + 0.30
+
+ann <- merge(pos[, c("genus","y")], kw_letters_df, by = "genus", all.x = TRUE)
+
+genus_lvls <- levels(total_inhibition_per_isolate$genus)
+genus_cols <- setNames(
+  vapply(genus_lvls, function(g) {
+    if (any(vapply(cf_pathogens, grepl, logical(1), x = g))) "#E69F00" else "gray60"
+  }, character(1)),
+  genus_lvls
+)
+
+z_outliers <- total_inhibition_per_isolate %>%
+  group_by(genus) %>%
+  mutate(.q1 = quantile(z_overall, 0.25, na.rm = TRUE),
+         .q3 = quantile(z_overall, 0.75, na.rm = TRUE),
+         .iqr = .q3 - .q1) %>%
+  filter(z_overall < .q1 - 1.5 * .iqr | z_overall > .q3 + 1.5 * .iqr) %>%
+  ungroup()
+
+z_score_per_isolate_plot <- ggplot(data = total_inhibition_per_isolate,
+                                    aes(x = genus, y = z_overall, fill = genus)) +
+  gg_theme +
+  geom_hline(yintercept = 0, linetype = "dashed",
+             color = "gray40", linewidth = 0.5) +
+  geom_boxplot(outlier.shape = NA, color = "black", linewidth = 0.3, alpha = 0.7) +
+  geom_point(data = z_outliers, aes(fill = genus),
+             shape = 21, color = "black", stroke = 0.2,
+             size = 1.2, alpha = 0.85,
+             position = ggbeeswarm::position_quasirandom(width = 0.25)) +
+  scale_fill_manual(values = genus_cols) +
+  scale_x_discrete(labels = lab_map) +
+  xlab("Isolate Genus") +
+  ylab("Inhibition Z-Score") +
+  theme(
+    axis.text.x  = ggtext::element_markdown(angle = 45, hjust = 1, size = 12, lineheight = 1.0),
+    axis.text.y  = element_text(color = "black", size = 10),
+    axis.title.x = element_text(color = "black", size = 12),
+    axis.title.y = element_text(color = "black", size = 12),
+    legend.position = "none"
+  ) +
+  geom_text(
+    data = ann,
+    aes(x = genus, y = y, label = letters),
+    inherit.aes = FALSE,
+    size = 3.5
+  ) +
+  expand_limits(y = max(ann$y, na.rm = TRUE) + 0.2)
+
+#ggsave("./figures/z_score_per_isolate_plot.pdf", z_score_per_isolate_plot, units = "in", height = 4, width = 6.47)
+```
+
+### Figure 4
+
+```{r fig_4, include=FALSE}
+aligned_5 <- cowplot::align_plots(isolate_inhibition_figure,
+                                   z_score_per_isolate_plot,
+                                   align = "v", axis = "lr")
+
+combined_inhibition_figure <- ggdraw(
+  plot_grid(aligned_5[[1]], leg_5a, aligned_5[[2]],
+            ncol = 1, rel_heights = c(1, 0.1, 1))
+) +
+  draw_label("A", x = 0.01, y = 0.99, hjust = 0, vjust = 1, fontface = "bold", size = 14) +
+  draw_label("B", x = 0.01, y = 0.475, hjust = 0, vjust = 1, fontface = "bold", size = 14)
+
+ggsave("./figures/figure_4.pdf", combined_inhibition_figure, units = "in",
+       height = 8.5, width = 6.47)
+```
+
+
+### Figure 6
+
+```{r fig_6, include=FALSE}
+lcms_mcol <- grep("\\.mean$", colnames(lcms_diff), value = TRUE)
+lcms_M    <- as.matrix(lcms_diff[, lcms_mcol])
+lcms_gmax <- apply(lcms_M, 1, max)
+lcms_gmin <- apply(lcms_M, 1, function(x) { x <- x[x > 0]; if (length(x)) min(x) else NA })
+lcms_feat <- lcms_diff %>%
+  transmute(rt_min = rtmed, mz = mzmed, pvalue = pvalue,
+            log2fc = log2(lcms_gmax / lcms_gmin), neglog10p = -log10(pvalue)) %>%
+  filter(pvalue <= lcms_p_cutoff, is.finite(log2fc)) %>%
+  arrange(neglog10p)
+
+lcms_tinh <- lcms_meta$inhibition[match(lcms_ciso, lcms_meta$isolate)]
+lcms_bidx <- which(lcms_ciso == "BHI"); lcms_keep <- which(lcms_ciso != "BHI")
+lcms_rtall <- range(unlist(lapply(lcms_tics, function(m) range(m[, 1]))))
+lcms_grid  <- seq(lcms_rtall[1], lcms_rtall[2], length.out = 3000)
+lcms_blank <- rowMeans(sapply(lcms_bidx, function(i) {
+  m <- lcms_tics[[i]]; approx(m[, 1], m[, 2], xout = lcms_grid, rule = 2)$y }))
+lcms_bfun  <- approxfun(lcms_grid, lcms_blank, rule = 2)
+lcms_mztop <- max(lcms_feat$mz)
+lcms_ticdf <- bind_rows(lapply(lcms_keep, function(i) {
+  m <- lcms_tics[[i]]
+  data.frame(sample = i, inhibition = lcms_tinh[i], rt_min = m[, 1] / 60,
+             tic = pmax(m[, 2] - lcms_bfun(m[, 1]), 0)) }))
+lcms_ticdf$mz <- lcms_ticdf$tic / max(lcms_ticdf$tic) * lcms_mztop * 0.95
+
+panel_6A <- ggplot() +
+  geom_line(data = lcms_ticdf, aes(rt_min, mz, group = sample, color = inhibition),
+            linewidth = 0.15, alpha = 0.5) +
+  geom_point(data = lcms_feat, aes(rt_min, mz, size = log2fc, alpha = neglog10p),
+             color = "#B00000", fill = "#B00000", shape = 21, stroke = 0.15) +
+  scale_color_manual(values = lcms_inh_pal, breaks = c("Yes", "No"), name = "Inhibitory") +
+  scale_radius(range = c(0.2, 4), name = expression(log[2]~"fold change")) +
+  scale_alpha_continuous(range = c(0.12, 0.9),
+                         name = expression(-log[10]~italic(P)*"-Value")) +
+  scale_x_continuous(expand = expansion(mult = c(0.01, 0.02))) +
+  scale_y_continuous(expand = expansion(mult = c(0.01, 0.03))) +
+  labs(x = "Retention Time (min)", y = expression(italic("m/z"))) +
+  fig1_theme +
+  theme(legend.title = element_text(size = 10), legend.text = element_text(size = 9),
+        legend.key = element_blank())
+
+lcms_fig_w <- 6.5; lcms_fig_h <- 8.5; lcms_rel_h <- c(1, 1.9); lcms_rel_w <- c(1, 0.3)
+lcms_plots_w <- lcms_fig_w * lcms_rel_w[1] / sum(lcms_rel_w)
+
+lcms_node_pos <- function(hc) {
+  m <- hc$merge; ord <- hc$order; cx <- numeric(nrow(m))
+  for (i in seq_len(nrow(m))) {
+    a <- m[i, 1]; b <- m[i, 2]
+    xa <- if (a < 0) which(ord == -a) - 0.5 else cx[a]
+    xb <- if (b < 0) which(ord == -b) - 0.5 else cx[b]
+    cx[i] <- (xa + xb) / 2
+  }
+  data.frame(x = cx, y = hc$height)
+}
+dir.create("r_objects", showWarnings = FALSE)
+if (file.exists("r_objects/lcms_pvclust.rds")) {
+  lcms_pv <- readRDS("r_objects/lcms_pvclust.rds")
+} else {
+  set.seed(8675309)   # pvclust bootstrap reproducibility
+  lcms_pv <- pvclust(lcms_matz, method.dist = "euclidean", method.hclust = "complete",
+                     nboot = lcms_n_boot, quiet = TRUE)
+  saveRDS(lcms_pv, "r_objects/lcms_pvclust.rds")
+}
+
+lcms_tmp <- tempfile(fileext = ".png")
+png(lcms_tmp, width = lcms_plots_w, height = 3, units = "in", res = 100)
+lcms_gA <- ggplotGrob(panel_6A + theme(legend.position = "none"))
+lcms_pl <- subset(lcms_gA$layout, name == "panel")
+lcms_left_mm <- convertWidth(sum(lcms_gA$widths[seq_len(min(lcms_pl$l) - 1)]), "mm", valueOnly = TRUE)
+invisible(dev.off()); unlink(lcms_tmp)
+
+lcms_topann <- HeatmapAnnotation(
+  HID = lcms_iso_meta$host, Inhibitory = lcms_iso_meta$inhibition,
+  col = list(HID = lcms_host_pal, Inhibitory = lcms_inh_pal),
+  simple_anno_size = unit(6, "mm"), show_annotation_name = FALSE,
+  show_legend = FALSE, gap = unit(1.5, "mm"))
+lcms_ht <- Heatmap(
+  lcms_matz, name = "Feature Z-Score", top_annotation = lcms_topann,
+  cluster_rows = TRUE, show_row_dend = FALSE, show_row_names = FALSE,
+  cluster_columns = as.dendrogram(lcms_pv$hclust), column_dend_height = unit(16, "mm"),
+  column_names_gp = gpar(fontsize = 10), column_names_rot = 45, col = lcms_val_col,
+  use_raster = TRUE, raster_quality = 3,
+  heatmap_legend_param = list(direction = "horizontal"), border = TRUE)
+panel_6B <- grid.grabExpr({
+  draw(lcms_ht, heatmap_legend_side = "bottom", show_annotation_legend = FALSE,
+       padding = unit(c(2, lcms_left_mm, 2, 2), "mm"))
+  decorate_column_dend("Feature Z-Score", {
+    np <- lcms_node_pos(lcms_pv$hclust)
+    grid.text(round(lcms_pv$edges$au * 100), x = unit(np$x, "native"), y = unit(np$y, "native"),
+              just = c("center", "bottom"), gp = gpar(fontsize = 5.5, col = "black"))
+  })
+}, width = lcms_plots_w, height = lcms_fig_h * lcms_rel_h[2] / sum(lcms_rel_h))
+
+lcms_legA <- get_legend(panel_6A + guides(color = "none") +
+  theme(legend.position = "right", legend.box = "vertical",
+        legend.title = element_text(size = 10), legend.text = element_text(size = 9)))
+lcms_legB <- packLegend(
+  Legend(title = "HID", labels = names(lcms_host_pal),
+         legend_gp = gpar(fill = unname(lcms_host_pal)),
+         title_gp = gpar(fontsize = 10, fontface = "bold"), labels_gp = gpar(fontsize = 9)),
+  Legend(title = "Inhibitory", labels = c("Yes", "No"),
+         legend_gp = gpar(fill = unname(lcms_inh_pal[c("Yes", "No")])),
+         title_gp = gpar(fontsize = 10, fontface = "bold"), labels_gp = gpar(fontsize = 9)),
+  gap = unit(5, "mm"))
+lcms_legB_grob <- grid.grabExpr(draw(lcms_legB))
+
+lcms_plots_col <- plot_grid(panel_6A + theme(legend.position = "none"), panel_6B,
+                            ncol = 1, labels = c("A", "B"), label_size = 12,
+                            label_fontface = "bold", rel_heights = lcms_rel_h)
+lcms_legs_col  <- plot_grid(lcms_legA, lcms_legB_grob, ncol = 1, rel_heights = lcms_rel_h)
+figure_6       <- plot_grid(lcms_plots_col, lcms_legs_col, ncol = 2, rel_widths = lcms_rel_w)
+
+dir.create("figures", showWarnings = FALSE)
+ggsave("figures/figure_6.pdf", figure_6, width = lcms_fig_w, height = lcms_fig_h, device = cairo_pdf)
+```
+
+## Pseudomonas genome comparison
+
+### Figure 7
+
+```{r fig_7, include=FALSE}
+local({
+  PD  <- file.path("derivedData", "genome_comparison", "plotdata")
+  FIG <- "figures"
+  dir.create(FIG, showWarnings = FALSE)
+
+  meta   <- read.csv(file.path(PD, "meta.csv"), stringsAsFactors = FALSE)
+  legend <- read.csv(file.path(PD, "bgc_legend.csv"), stringsAsFactors = FALSE)
+
+  # palette follows this document (RdYlBu / Okabe-Ito)
+  VAR_CLASSES <- c("Frameshift", "Missense", "Silent", "Intergenic")
+  VAR_COL <- c("Frameshift" = "#D73027", "Missense" = "#E69F00",
+               "Silent" = "#999999", "Intergenic" = "#CC79A7")
+
+  # radii (unit circle)
+  R_BGC_OUT <- 1.00; R_BGC_IN <- 0.90
+  R_MUT_OUT <- 0.86; R_MUT_IN <- 0.72
+  R_NUM     <- 1.13
+  R_MB      <- 1.21
+
+  xy <- function(r, f) list(x = r * sin(2 * pi * f), y = r * cos(2 * pi * f))
+  tf <- function(f, o, off) ((o * f) + off) %% 1       # reorient panel B onto A
+
+  arc_poly <- function(f1, f2, ri, ro, col) {
+    if (f2 < f1) f2 <- f2 + 1
+    ff  <- seq(f1, f2, length.out = max(2, round((f2 - f1) * 400)))
+    ang <- 2 * pi * ff
+    polygon(c(ro * sin(ang), rev(ri * sin(ang))),
+            c(ro * cos(ang), rev(ri * cos(ang))), col = col, border = NA)
+  }
+
+  spread_ang <- function(ang, mingap) {                # de-overlap numeric labels
+    ord <- order(ang); a <- ang[ord]; n <- length(a)
+    for (it in 1:400) {
+      moved <- FALSE
+      for (i in 1:n) {
+        j <- if (i == n) 1 else i + 1
+        gap <- (a[j] - a[i]) %% (2 * pi)
+        if (gap < mingap) {
+          d <- (mingap - gap) / 2
+          a[i] <- (a[i] - d) %% (2 * pi); a[j] <- (a[j] + d) %% (2 * pi); moved <- TRUE
+        }
+      }
+      if (!moved) break
+    }
+    out <- numeric(n); out[ord] <- a; out
+  }
+
+  draw_panel <- function(donor, panel) {
+    m   <- meta[meta$donor == donor, ]
+    o <- m$orient; off <- m$offset
+    bgc <- read.csv(file.path(PD, sprintf("bgc_%s.csv", donor)), stringsAsFactors = FALSE)
+    mut <- read.csv(file.path(PD, sprintf("mut_%s.csv", donor)), stringsAsFactors = FALSE)
+    mut <- mut[mut$noninh_specific == 1, , drop = FALSE]          # only variants in the non-inhibitory genome
+    L   <- m$length
+
+    par(mar = c(0.4, 0.4, 0.4, 0.4))
+    plot(NA, xlim = c(-1.32, 1.32), ylim = c(-1.30, 1.34), asp = 1,
+         axes = FALSE, xlab = "", ylab = "")
+
+    arc_poly(0, 1, R_BGC_IN, R_BGC_OUT, col = "#ECEAE2")           # backbone
+
+    for (mb in 0:floor(L / 1e6)) {                                 # Mb ticks
+      f <- mb * 1e6 / L
+      p1 <- xy(R_BGC_OUT, f); p2 <- xy(R_BGC_OUT + 0.035, f)
+      segments(p1$x, p1$y, p2$x, p2$y, col = "#9A988F", lwd = 0.9)
+      pl <- xy(R_MB, f); text(pl$x, pl$y, mb, col = "#6b6a64", cex = 0.95)
+    }
+
+    for (i in seq_len(nrow(bgc))) {                                # BGC arcs
+      a <- tf(bgc$f_start[i], o, off); b <- tf(bgc$f_end[i], o, off)
+      if (o == -1) { tmp <- a; a <- b; b <- tmp }
+      arc_poly(a, b, R_BGC_IN, R_BGC_OUT, col = bgc$color[i])
+    }
+
+    ang0 <- 2 * pi * tf(bgc$f_mid, o, off)
+    angL <- spread_ang(ang0, mingap = 0.115)
+    for (i in seq_len(nrow(bgc))) {
+      a0 <- xy(R_BGC_OUT, ang0[i] / (2 * pi)); aL <- xy(R_NUM, angL[i] / (2 * pi))
+      segments(a0$x, a0$y, aL$x, aL$y, col = "#B4B2A9", lwd = 0.7)
+      text(aL$x, aL$y, bgc$num[i], cex = 1.15, col = "#2C2C2A")
+    }
+
+    # variant ticks (only variants in the non-inhibitory genome), colored by
+    # mutation class; * marks BGC-associated variants
+    for (i in seq_len(nrow(mut))) {
+      f <- tf(mut$f[i], o, off)
+      p1 <- xy(R_MUT_IN, f); p2 <- xy(R_MUT_OUT, f)
+      segments(p1$x, p1$y, p2$x, p2$y, col = VAR_COL[[mut$class[i]]], lwd = 2.0)
+      if (mut$inbgc[i] == 1) {                                    # BGC-associated
+        ps <- xy(R_MUT_IN - 0.035, f)
+        text(ps$x, ps$y, "*", col = "#2C2C2A", cex = 1.8, font = 2)
+      }
+    }
+
+    text(0,  0.15, m$reference, cex = 2.0, font = 2)              
+    text(0,  0.01, donor, cex = 1.15, col = "#5F5E5A")
+    text(0, -0.12, sprintf("%.2f Mb", L / 1e6), cex = 1.1, col = "#5F5E5A")
+    text(0, -0.25, sprintf("%d variants", nrow(mut)), cex = 1.1, col = "#5F5E5A")
+    text(-1.30, 1.30, panel, cex = 2.0, font = 2, adj = 0)
+  }
+
+  draw_mut_key <- function() {
+    par(mar = c(0, 0.5, 0, 0.5))
+    plot(NA, xlim = c(0, 1), ylim = c(0, 1), axes = FALSE, xlab = "", ylab = "")
+    cx <- 1.1; segw <- 0.014; gap <- 0.03               
+    x <- 0.01
+    for (j in seq_along(VAR_CLASSES)) {                 
+      segments(x, 0.5, x + segw, 0.5, col = VAR_COL[[VAR_CLASSES[j]]], lwd = 5)
+      text(x + segw + 0.006, 0.5, VAR_CLASSES[j], adj = 0, cex = cx, col = "#000000")
+      x <- x + segw + 0.006 + strwidth(VAR_CLASSES[j], cex = cx) + gap
+    }
+    text(x, 0.5, "*", adj = 0, cex = cx * 1.3, font = 2, col = "#2C2C2A")  # BGC glyph
+    text(x + strwidth("* ", cex = cx), 0.5, "BGC-Associated", adj = 0, cex = cx, col = "#000000")
+  }
+
+  draw_bgc_legend <- function() {                      
+    par(mar = c(0.1, 0.5, 0.1, 0.5))
+    plot(NA, xlim = c(0, 1), ylim = c(0, 1), axes = FALSE, xlab = "", ylab = "")
+    n <- nrow(legend); ncols <- 9
+    text(0.0, 0.93, "BGCs", adj = 0, cex = 1.2, font = 2, col = "#000000")
+    colw <- 1 / ncols; swx <- 0.008; swy <- 0.06; y_row <- c(0.58, 0.20)
+    for (i in seq_len(n)) {
+      r  <- if (i <= ncols) 1 else 2
+      cc <- if (i <= ncols) i else i - ncols
+      x <- (cc - 1) * colw + 0.004; y <- y_row[r]
+      rect(x, y - swy, x + swx, y + swy, col = legend$color[i], border = "#00000030", lwd = 0.4)
+      text(x + swx + 0.006, y, sprintf("%d. %s", legend$num[i], legend$label[i]),
+           adj = 0, cex = 0.82, col = "#000000")
+    }
+  }
+
+  render <- function(open_dev, ext) {
+    open_dev()
+    layout(matrix(c(1, 2,
+                    3, 3,
+                    4, 4), nrow = 3, byrow = TRUE),
+           widths = c(1, 1), heights = c(1, 0.12, 0.22))
+    draw_panel("HID07", "A")
+    draw_panel("HID08", "B")
+    draw_mut_key()               
+    draw_bgc_legend()            
+    dev.off()
+  }
+
+  tryCatch(render(function() cairo_pdf(file.path(FIG, "figure_7.pdf"), width = 15, height = 8.7,
+                                       pointsize = 12), "pdf"),
+           error = function(e) message("Figure 7 PDF skipped (locked?): ", conditionMessage(e)))
+})
+```
+
+### Tables S4 and S5
+
+
+```{r tables_S4_S5, include=FALSE}
+lcms_gc_tab <- file.path("derivedData", "genome_comparison", "tables")
+dir.create("tables", showWarnings = FALSE)
+
+
+build_variant_table <- function(donor, outfile) {
+  v <- read.delim(file.path(lcms_gc_tab, paste0(donor, "_differences.tsv")),
+                  check.names = FALSE, stringsAsFactors = FALSE, colClasses = "character")
+  b <- read.delim(file.path(lcms_gc_tab, paste0(donor, "_variants_in_BGCs.tsv")),
+                  check.names = FALSE, stringsAsFactors = FALSE)
+  v$TYPE <- c(snp = "SNP", ins = "Insertion", del = "Deletion")[v$TYPE]
+  v$BGC_associated <- ifelse(as.integer(v$POS) %in% b$position, "Yes", "No")
+  v$BGC <- b$BGC[match(as.integer(v$POS), b$position)]; v$BGC[is.na(v$BGC)] <- ""
+  ren <- c(CHROM = "Contig", POS = "Position", TYPE = "Type", REF = "Ref", ALT = "Alt",
+           EFFECT = "Effect", LOCUS_TAG = "Locus_tag", GENE = "Gene", PRODUCT = "Product")
+  hit <- names(v) %in% names(ren); names(v)[hit] <- ren[names(v)[hit]]
+  v[is.na(v)] <- ""                                  
+  write.csv(v, outfile, row.names = FALSE)
+  v
+}
+table_S4 <- build_variant_table("HID07", file.path("tables", "Table_S4.csv"))  # HID07
+table_S5 <- build_variant_table("HID08", file.path("tables", "Table_S5.csv"))  # HID08
+```
+
+### Figure S1A
+
+```{r fig_S1A, include=FALSE}
+pathogen_dominant_obs <- per_sample_ra_lab %>%
+  filter(ra > 50, group == "pathogen") %>%
+  mutate(taxon = factor(as.character(taxon), levels = pathogen_in_table))
+
+pw_pathogen <- pairwise.wilcox.test(pathogen_dominant_obs$ra,
+                                     pathogen_dominant_obs$taxon,
+                                     p.adjust.method = "BH", exact = FALSE)
+pw_pathogen_mat <- pw_pathogen$p.value
+pw_pathogen_idx <- which(!is.na(pw_pathogen_mat), arr.ind = TRUE)
+pw_pathogen_p   <- pw_pathogen_mat[pw_pathogen_idx]
+names(pw_pathogen_p) <- paste(rownames(pw_pathogen_mat)[pw_pathogen_idx[, "row"]],
+                              colnames(pw_pathogen_mat)[pw_pathogen_idx[, "col"]],
+                              sep = "-")
+pathogen_letters <- multcompLetters(pw_pathogen_p, threshold = 0.05)
+
+raw_pathogen_letters <- pathogen_letters$Letters[pathogen_in_table]
+pathogen_chars       <- unique(unlist(strsplit(raw_pathogen_letters, "")))
+pathogen_letter_map  <- setNames(letters[seq_along(pathogen_chars)], pathogen_chars)
+pathogen_letters_df  <- data.frame(
+  taxon  = pathogen_in_table,
+  letter = sapply(raw_pathogen_letters, function(l)
+    paste(sort(pathogen_letter_map[strsplit(l, "")[[1]]]), collapse = "")),
+  row.names = NULL
+)
+
+pathogen_letter_pos <- pathogen_dominant_obs %>%
+  group_by(taxon) %>%
+  summarize(y_pos = max(ra) + 2, .groups = "drop") %>%
+  left_join(pathogen_letters_df, by = "taxon")
+
+n_per_pathogen <- pathogen_dominant_obs %>%
+  count(taxon) %>%
+  mutate(taxon = as.character(taxon))
+n_pathogen_map <- setNames(n_per_pathogen$n, n_per_pathogen$taxon)
+
+pathogen_axis_labels <- setNames(
+  vapply(pathogen_in_table, function(g) {
+    n <- n_pathogen_map[[g]]
+    if (is.null(n) || is.na(n)) n <- 0
+    paste0("<span style='color:#E69F00;'>",
+           "<span style='font-weight:bold; font-style:italic'>", g, "</span>",
+           "<br/>(n=", scales::comma(n), ")",
+           "</span>")
+  }, character(1)),
+  pathogen_in_table
+)
+
+panel_1b_outliers <- pathogen_dominant_obs %>%
+  group_by(taxon) %>%
+  mutate(.q1 = quantile(ra, 0.25, na.rm = TRUE),
+         .q3 = quantile(ra, 0.75, na.rm = TRUE),
+         .iqr = .q3 - .q1) %>%
+  filter(ra < .q1 - 1.5 * .iqr | ra > .q3 + 1.5 * .iqr) %>%
+  ungroup()
+
+panel_1b <- ggplot(pathogen_dominant_obs, aes(x = taxon, y = ra, fill = taxon)) +
+  geom_boxplot(alpha = 0.7, width = 0.5, notch = TRUE, outlier.shape = NA) +
+  geom_point(data = panel_1b_outliers, aes(fill = taxon),
+             shape = 21, color = "black", stroke = 0.2,
+             size = 1, alpha = 0.85) +
+  geom_text(data = pathogen_letter_pos,
+            aes(x = taxon, y = y_pos, label = letter),
+            inherit.aes = FALSE, size = 3) +
+  scale_fill_manual(values = pathogen_palette, guide = "none") +
+  scale_x_discrete(labels = pathogen_axis_labels) +
+  scale_y_continuous(limits = c(45, 110), breaks = seq(50, 100, by = 10),
+                     expand = expansion(mult = c(0, 0))) +
+  labs(x = "Dominant Pathogen", y = "Relative Abundance (%)") +
+  fig1_theme +
+  theme(axis.text.x = ggtext::element_markdown(angle = 45, hjust = 1, size = 10))
+```
+
+### Figure S1B
+
+```{r fig_S1B, include=FALSE}
+group_cols <- c("Pathogen" = "#E69F00", "Oropharyngeal" = "gray60")
+
+dominant_obs_grouped <- per_sample_ra_lab %>%
+  filter(ra > 50) %>%
+  mutate(group = factor(ifelse(group == "pathogen", "Pathogen", "Oropharyngeal"),
+                        levels = c("Pathogen", "Oropharyngeal")))
+
+n_per_group <- dominant_obs_grouped %>%
+  count(group) %>%
+  mutate(group_long = recode(as.character(group),
+                             Pathogen      = "Pathogen-Dominated",
+                             Oropharyngeal = "Oropharyngeal-Dominated"),
+         label = paste0(group_long, "<br/>(n=", scales::comma(n), ")"))
+group_label_map <- setNames(n_per_group$label, as.character(n_per_group$group))
+
+q2_p_value <- q2_wilcox$p.value
+q2_p_label <- if (q2_p_value < 2.2e-16) {
+  "italic(P) < '2.2e-16'"
+} else {
+  sprintf("italic(P) == '%.1g'", q2_p_value)
+}
+
+panel_1c_outliers <- dominant_obs_grouped %>%
+  group_by(group) %>%
+  mutate(.q1 = quantile(ra, 0.25, na.rm = TRUE),
+         .q3 = quantile(ra, 0.75, na.rm = TRUE),
+         .iqr = .q3 - .q1) %>%
+  filter(ra < .q1 - 1.5 * .iqr | ra > .q3 + 1.5 * .iqr) %>%
+  ungroup()
+
+panel_1c <- ggplot(dominant_obs_grouped, aes(x = group, y = ra, fill = group)) +
+  geom_boxplot(alpha = 0.7, width = 0.5, notch = TRUE, outlier.shape = NA) +
+  geom_point(data = panel_1c_outliers, aes(fill = group),
+             shape = 21, color = "black", stroke = 0.2,
+             size = 1, alpha = 0.85) +
+  scale_fill_manual(values = group_cols, guide = "none") +
+  scale_x_discrete(labels = group_label_map) +
+  scale_y_continuous(limits = c(45, 110), breaks = seq(50, 100, by = 10),
+                     expand = expansion(mult = c(0, 0))) +
+  annotate("segment", x = 1, xend = 2, y = 104, yend = 104,
+           color = "black", linewidth = 0.4) +
+  annotate("segment", x = 1, xend = 1, y = 102, yend = 104,
+           color = "black", linewidth = 0.4) +
+  annotate("segment", x = 2, xend = 2, y = 102, yend = 104,
+           color = "black", linewidth = 0.4) +
+  annotate("text", x = 1.5, y = 107, label = q2_p_label,
+           parse = TRUE, size = 2.8, color = "black") +
+  labs(x = NULL, y = "Relative Abundance (%)") +
+  fig1_theme +
+  theme(axis.text.x = ggtext::element_markdown(angle = 45, hjust = 1, size = 10))
+```
+
+### Figure S1
+
+```{r fig_S1, include=FALSE}
+figure_S1 <- panel_1b + panel_1c +
+  patchwork::plot_layout(widths = c(1.6, 1)) +
+  patchwork::plot_annotation(
+    tag_levels = list(c("A", "B")),
+    theme = theme(plot.tag = element_text(size = 12, face = "bold"))
+  )
+
+dir.create("figures", showWarnings = FALSE)
+ggsave("figures/figure_S1.pdf", figure_S1, units = "in",
+       width = 9, height = 5, device = cairo_pdf)
+```
+
+### Figure S2
+
+```{r fig_S2, include=FALSE}
+if (!"Age_bin" %in% colnames(nmds_scores)) {
+  nmds_scores$Age_bin <- cut(nmds_scores$Age,
+    breaks = c(-Inf, 2, 12, 18, 40, Inf), right = FALSE,
+    labels = c("Infant", "Child", "Adolescent", "Adult", "Senior"))
+}
+if (!"FEV1_bin" %in% colnames(nmds_scores)) {
+  nmds_scores$FEV1_bin <- cut(nmds_scores$FEV1,
+    breaks = c(-Inf, 30, 50, 80, Inf), right = FALSE,
+    labels = c("Very Severe", "Severe", "Moderate", "Mild"))
+}
+
+s1_base <- theme_classic() +
+  theme(
+    axis.text        = element_text(color = "black", size = 8),
+    axis.title       = element_text(color = "black", size = 10),
+    axis.title.x     = element_text(margin = margin(t = 0)),
+    axis.title.y     = element_text(margin = margin(r = 3)),
+    axis.ticks       = element_line(color = "black", linewidth = 0.25),
+    axis.line        = element_blank(),
+    panel.border     = element_rect(color = "black", fill = NA, linewidth = 0.25),
+    plot.background  = element_blank(),
+    plot.margin      = margin(2, 5, 2, 2),
+    plot.tag         = element_text(size = 12, face = "bold"),
+    legend.position  = "bottom",
+    legend.title     = element_text(size = 7, face = "bold"),
+    legend.text      = element_text(size = 6),
+    legend.key.size  = unit(0.25, "cm"),
+    legend.margin    = margin(0, 0, 0, 0),
+    legend.box.margin = margin(-3, 0, 0, 0)
+  )
+
+age_levels_s1   <- c("Infant", "Child", "Adolescent", "Adult", "Senior")
+age_range_s1    <- c("Infant"     = "0\u20131",
+                     "Child"      = "2\u201311",
+                     "Adolescent" = "12\u201317",
+                     "Adult"      = "18\u201339",
+                     "Senior"     = "40+")
+age_cols_s1     <- c("Infant" = "#F0E442", "Child" = "#E69F00",
+                     "Adolescent" = "#CC79A7", "Adult" = "#4575B4",
+                     "Senior" = "#56B4E9")
+fev1_levels_s1  <- c("Mild", "Moderate", "Severe", "Very Severe")
+fev1_range_s1   <- c("Mild" = "\u226580%", "Moderate" = "50\u201379%",
+                     "Severe" = "30\u201349%", "Very Severe" = "<30%")
+fev1_cols_s1    <- c("Mild" = "#4575B4", "Moderate" = "#ABD9E9",
+                     "Severe" = "#FDAE61", "Very Severe" = "#D73027")
+
+stress_lbl <- paste0("Stress == ", signif(nmds_stress, 2))
+
+legend_with_n <- function(values, label_map) {
+  counts <- table(factor(values, levels = names(label_map)))
+  setNames(paste0(label_map[names(counts)], " (N=", counts, ")"),
+           names(counts))
+}
+
+s1a_df <- nmds_scores %>%
+  filter(!is.na(Age_bin)) %>%
+  mutate(Age_bin = factor(Age_bin, levels = age_levels_s1))
+age_labels_s1  <- legend_with_n(s1a_df$Age_bin, age_range_s1)
+
+panel_s1a <- ggplot(s1a_df, aes(MDS1, MDS2, color = Age_bin)) +
+  geom_point(size = 0.5, alpha = 0.5) +
+  stat_ellipse(type = "norm", level = 0.95, linewidth = 0.4) +
+  scale_color_manual(values = age_cols_s1, labels = age_labels_s1,
+                      name = "Age (years)", drop = FALSE) +
+  annotate("text", x = Inf, y = -Inf, label = stress_lbl, parse = TRUE,
+           hjust = 1.05, vjust = -0.5, size = 2) +
+  labs(x = "NMDS1", y = "NMDS2", tag = "A") +
+  s1_base +
+  theme(aspect.ratio = 1) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE,
+                               override.aes = list(size = 2, alpha = 1)))
+
+s1b_df <- nmds_scores %>%
+  filter(!is.na(FEV1_bin)) %>%
+  mutate(FEV1_bin = factor(FEV1_bin, levels = fev1_levels_s1))
+fev1_labels_s1 <- legend_with_n(s1b_df$FEV1_bin, fev1_range_s1)
+
+panel_s1b <- ggplot(s1b_df, aes(MDS1, MDS2, color = FEV1_bin)) +
+  geom_point(size = 0.5, alpha = 0.5) +
+  stat_ellipse(type = "norm", level = 0.95, linewidth = 0.4) +
+  scale_color_manual(values = fev1_cols_s1, labels = fev1_labels_s1,
+                      name = expression(FEV[1]~pp), drop = FALSE) +
+  annotate("text", x = Inf, y = -Inf, label = stress_lbl, parse = TRUE,
+           hjust = 1.05, vjust = -0.5, size = 2) +
+  labs(x = "NMDS1", y = "NMDS2", tag = "B") +
+  s1_base +
+  theme(aspect.ratio = 1) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE, override.aes = list(size = 2, alpha = 1)))
+
+s1c_df <- nmds_scores %>%
+  filter(!is.na(Sex) & Sex != "")
+sex_labels_s1 <- setNames(
+  paste0(names(table(s1c_df$Sex)), " (N=", as.integer(table(s1c_df$Sex)), ")"),
+  names(table(s1c_df$Sex))
+)
+
+panel_s1c <- ggplot(s1c_df, aes(MDS1, MDS2, color = Sex)) +
+  geom_point(size = 0.5, alpha = 0.5) +
+  stat_ellipse(type = "norm", level = 0.95, linewidth = 0.4) +
+  scale_color_brewer(palette = "Set1", labels = sex_labels_s1, name = "Sex") +
+  annotate("text", x = Inf, y = -Inf, label = stress_lbl, parse = TRUE,
+           hjust = 1.05, vjust = -0.5, size = 2) +
+  labs(x = "NMDS1", y = "NMDS2", tag = "C") +
+  s1_base +
+  theme(aspect.ratio = 1) +
+  guides(color = guide_legend(nrow = 1, override.aes = list(size = 2, alpha = 1)))
+
+figure_s1 <- panel_s1a | panel_s1b | panel_s1c
+
+ggsave("figures/figure_S2.pdf", figure_s1, width = 9, height = 6, device = cairo_pdf)
+```
+
+### Figure S3
+
+```{r fig_S3, include=FALSE}
+present_pathogens <- sort(intersect(fig1_pathogen_order, unique(bp_df$dominant_pathogen)))
+present_pathogens <- setdiff(present_pathogens, "Haemophilus")
+dom_path_levels   <- c(present_pathogens, "Other")
+dom_path_cols     <- c(pathogen_palette[present_pathogens], "Other" = "gray60")
+
+bp_plot_df_s2 <- bp_adj_df %>%
+  mutate(
+    dominant_pathogen = if_else(dominant_pathogen == "Haemophilus",
+                                "Other", dominant_pathogen),
+    dominant_pathogen = factor(dominant_pathogen, levels = dom_path_levels)
+  )
+
+dom_path_counts <- bp_plot_df_s2 %>% count(dominant_pathogen)
+dom_path_labels <- setNames(
+  vapply(dom_path_levels, function(g) {
+    n <- dom_path_counts$n[dom_path_counts$dominant_pathogen == g]
+    if (length(n) == 0) n <- 0
+    if (g == "Other") {
+      paste0("Other (N=", scales::comma(n), ")")
+    } else {
+      paste0("<i>", g, "</i> (N=", scales::comma(n), ")")
+    }
+  }, character(1)),
+  dom_path_levels
+)
+
+panel_S2_base <- ggplot(bp_plot_df_s2, aes(x = bp_dom, y = FEV1_adj)) +
+  geom_line(data = boot_lines_bp, aes(x = x, y = y, group = boot),
+            color = "lightpink", alpha = 0.15) +
+  geom_vline(xintercept = 0.5, linetype = "dashed",
+             color = "gray40", linewidth = 0.5) +
+  geom_jitter(aes(fill = dominant_pathogen),
+              shape = 21, color = "black", stroke = 0.2,
+              width = 0.005, alpha = 0.85, size = 1.5) +
+  geom_smooth(method = "lm", color = "#D73027", se = FALSE, linewidth = 1.1) +
+  scale_fill_manual(values = dom_path_cols, labels = dom_path_labels,
+                    name = "Most Abundant Genus", drop = FALSE) +
+  scale_x_continuous(breaks = seq(0.2, 1.0, 0.2)) +
+  scale_y_continuous() +
+  labs(x = "Dominance (BP)",
+       y = expression(Lung~Function~"("*FEV[1]~pp[Adj]*")")) +
+  fig1_theme +
+  theme(legend.position   = "bottom",
+        legend.text       = ggtext::element_markdown(size = 9),
+        legend.title      = element_text(size = 10, face = "bold"),
+        legend.key.height = unit(0.35, "cm"),
+        legend.margin     = margin(t = 4, b = 0),
+        aspect.ratio      = NULL) +
+  guides(fill = guide_legend(nrow = 4, ncol = 2, byrow = TRUE,
+                             override.aes = list(alpha = 1, size = 1.5, shape = 21)))
+
+panel_S2_fixed <- egg::set_panel_size(panel_S2_base,
+                                       width  = fig2_panel_size,
+                                       height = fig2_panel_size)
+
+figure_S3 <- panel_S2_fixed
+
+dir.create("figures", showWarnings = FALSE)
+ggsave("figures/figure_S3.pdf", figure_S3,
+       width = 7, height = 6, device = cairo_pdf)
+```
+
+### Figure S4
+
+```{r fig_S4, include=FALSE}
+hid_bold_S4       <- c("HID23", "HID16", "HID7", "HID8", "HID17")
+isolate_hilite_S4 <- c("NB0108", "NB0203", "NB1111", "NB0883", "NB0049",
+                       "NB0184", "NB0017", "NB0078", "NB1046", "NB0219",
+                       "RSD0018", "NB0031", "NB0050", "NB0126", "NB0186",
+                       "NB1386")
+
+hid_order_S4 <- pseudomonas_variable_isolates %>%
+  arrange(desc(z_spread)) %>%
+  pull(hid)
+
+s4_df <- total_inhibition_per_isolate %>%
+  filter(grepl("Pseudomonas", genus, ignore.case = TRUE),
+         hid %in% hid_order_S4) %>%
+  mutate(
+    hid       = factor(hid, levels = hid_order_S4),
+    highlight = isolate %in% isolate_hilite_S4
+  )
+
+pad_hid_S4 <- function(h) {
+  num <- sub("^HID", "", h)
+  sprintf("HID%02d", as.integer(num))
+}
+
+hid_axis_labels_S4 <- setNames(
+  vapply(hid_order_S4, function(h) {
+    lab <- pad_hid_S4(h)
+    if (h %in% hid_bold_S4) paste0("**", lab, "**") else lab
+  }, character(1)),
+  hid_order_S4
+)
+
+panel_S4 <- ggplot(s4_df, aes(x = hid, y = z_within_genus)) +
+  geom_hline(yintercept = 0, linetype = "dashed",
+             color = "gray40", linewidth = 0.5) +
+  geom_boxplot(outlier.shape = NA, fill = "gray92",
+               color = "black", linewidth = 0.3, width = 0.6) +
+  geom_jitter(aes(color = highlight),
+                            cex = 2, size = 1.6, alpha = 0.85) +
+  scale_color_manual(values = c(`FALSE` = "gray40", `TRUE` = "#E69F00"),
+                      guide = "none") +
+  scale_x_discrete(labels = hid_axis_labels_S4) +
+  labs(x = "Donor ID", y = "Within-Genus Inhibition Z-Score") +
+  fig1_theme +
+  theme(axis.text.x = ggtext::element_markdown(angle = 45, hjust = 1, size = 10))
+
+figure_S4 <- panel_S4
+
+dir.create("figures", showWarnings = FALSE)
+ggsave("figures/figure_S4.pdf", figure_S4,
+       width = 9, height = 4.5, device = cairo_pdf)
+```
+
+### Figure S5B
+
+
+```{r fig_S5B, include=FALSE}
+lcms_iso_sub <- t(apply(lcms_sub, 1, function(v) tapply(v, lcms_iso, mean)))
+lcms_iprof   <- t(lcms_iso_sub); lcms_iprof <- lcms_iprof / rowSums(lcms_iprof)
+dir.create("r_objects", showWarnings = FALSE)
+if (file.exists("r_objects/lcms_permanova.rds")) {
+  lcms_perm <- readRDS("r_objects/lcms_permanova.rds")
+} else {
+  set.seed(8675309)   # PERMANOVA permutation reproducibility
+  lcms_perm <- adonis2(vegdist(lcms_iprof, "bray") ~ host + inhibition,
+                       data = lcms_iso_meta, by = "margin", permutations = lcms_n_perm)
+  saveRDS(lcms_perm, "r_objects/lcms_permanova.rds")
+}
+lcms_msres <- lcms_perm["Residual", "SumOfSqs"] / lcms_perm["Residual", "Df"]
+lcms_sstot <- lcms_perm["Total", "SumOfSqs"]
+lcms_omega2 <- function(tm) (lcms_perm[tm, "SumOfSqs"] - lcms_perm[tm, "Df"] * lcms_msres) /
+  (lcms_sstot + lcms_msres)
+lcms_eff <- data.frame(
+  term   = c("host (donor)", "inhibition"),
+  Df     = c(lcms_perm["host", "Df"], lcms_perm["inhibition", "Df"]),
+  R2     = c(lcms_perm["host", "R2"], lcms_perm["inhibition", "R2"]),
+  omega2 = c(lcms_omega2("host"), lcms_omega2("inhibition")),
+  F      = c(lcms_perm["host", "F"], lcms_perm["inhibition", "F"]),
+  p      = c(lcms_perm["host", "Pr(>F)"], lcms_perm["inhibition", "Pr(>F)"]))
+
+# NMDS on per-injection profiles (Bray-Curtis, total-sum-scaled)
+lcms_sprof <- t(lcms_sub); lcms_sprof <- lcms_sprof / rowSums(lcms_sprof)
+if (file.exists("r_objects/lcms_nmds.rds")) {
+  lcms_mds <- readRDS("r_objects/lcms_nmds.rds")
+} else {
+  set.seed(1)
+  lcms_mds <- metaMDS(lcms_sprof, distance = "bray", k = 2, trymax = 200, trace = 0)
+  saveRDS(lcms_mds, "r_objects/lcms_nmds.rds")
+}
+lcms_mdsdf <- data.frame(lcms_samp_meta, NMDS1 = lcms_mds$points[, 1], NMDS2 = lcms_mds$points[, 2])
+lcms_lim   <- range(c(lcms_mdsdf$NMDS1, lcms_mdsdf$NMDS2))
+lcms_lim   <- lcms_lim + c(-0.05, 0.05) * diff(lcms_lim)
+
+figure_S5B <- ggplot(lcms_mdsdf, aes(NMDS1, NMDS2)) +
+  stat_ellipse(aes(color = host, group = host), type = "t", linewidth = 0.4, show.legend = FALSE) +
+  stat_ellipse(data = subset(lcms_mdsdf, inhibition == "Yes"), color = lcms_inh_pal[["Yes"]],
+               type = "t", linetype = "22", linewidth = 1) +
+  stat_ellipse(data = subset(lcms_mdsdf, inhibition == "No"), color = lcms_inh_pal[["No"]],
+               type = "t", linetype = "22", linewidth = 1) +
+  geom_point(aes(color = host, shape = inhibition), size = 3, stroke = 0.6) +
+  scale_color_manual(values = lcms_host_pal, name = "HID") +
+  scale_shape_manual(values = c(Yes = 16, No = 17), name = "Inhibitory") +
+  labs(x = "NMDS1", y = "NMDS2") +
+  coord_fixed(1, xlim = lcms_lim, ylim = lcms_lim) + fig1_theme
+
+dir.create("figures", showWarnings = FALSE)
+ggsave("figures/figure_S5B.pdf", figure_S5B, width = 6.5, height = 6.5, device = cairo_pdf)
+```

@@ -1,0 +1,42 @@
+# create stability files from input reads
+make.file(inputdir=./derivedData/reads/, type=gz, prefix=stability)
+
+# assemble paired-end reads into contigs
+make.contigs(file=current, processors=14)
+
+# align sequences to reference database
+align.seqs(fasta=current, reference=./rawData/references/mothur_files/HOMD_16S_rRNA_RefSeq_V15.23.aligned.fasta, flip=T)
+
+# screen sequences to remove those that do not meet length, homopolymer, or ambiguous base requirements
+screen.seqs(fasta=current, count=current, optimize=start-end-minlength, maxhomop=8)
+
+# filter sequences to remove uninformative columns (e.g., gaps)
+filter.seqs(fasta=current, vertical=T, trump=.)
+
+# pre-cluster sequences to reduce sequencing errors by merging similar sequences
+pre.cluster(fasta=current, count=current, diffs=2)
+
+# detect and remove chimeras using VSEARCH
+chimera.vsearch(fasta=current, count=current, dereplicate=t)
+
+# remove sequences flagged as chimeric
+remove.seqs(fasta=current, count=current, accnos=current)
+
+# classify sequences against the HOMD reference database
+classify.seqs(fasta=current, count=current, reference=./rawData/references/mothur_files/HOMD_16S_rRNA_RefSeq_V15.23.aligned.fasta, taxonomy=./rawData/references/mothur_files/HOMD_16S_rRNA_RefSeq_V15.23.mothur.taxonomy, cutoff=80)
+
+# remove unwanted lineages
+remove.lineage(fasta=current, count=current, taxonomy=current, taxon=unknown;-Archaea;-Eukaryota;)
+
+# summarize classification results by taxa
+summary.tax(taxonomy=current, count=current)
+
+# output a file showing how many sequences belong to each sample group
+count.groups(count=current)
+
+# generate a more detailed summary that shows the number of sequences classified into each taxon
+summary.tax(taxonomy=current, count=current)
+
+# create a shared file for OTU-style format that counts sequences assigned to each OTU/taxon.
+make.shared(list=current, count=current)
+list.seqs(taxonomy=current)
