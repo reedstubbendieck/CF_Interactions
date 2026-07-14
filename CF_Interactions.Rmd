@@ -294,7 +294,6 @@ nmds_stress <- nmds$stress
 if (file.exists("r_objects/permanova_combined.rds")) {
   permanova_combined <- readRDS("r_objects/permanova_combined.rds")
 } else {
-  set.seed(8675309)
   N_PERM <- 9999
 
   bray_mat <- as.matrix(bray_dist)
@@ -416,7 +415,6 @@ technical_joint_R2 <- permanova_combined$R2[permanova_combined$model == "joint t
 if (file.exists("r_objects/permanova_subsampling_summary.rds")) {
   permanova_subsampling_summary <- readRDS("r_objects/permanova_subsampling_summary.rds")
 } else {
-  set.seed(8675309)
   N_PERM_SUB <- 999
   N_REPS     <- 1000
   SUB_N      <- 100
@@ -1059,17 +1057,14 @@ pseudomonas_variable_isolates <- total_inhibition_per_isolate %>%
 ## LC-MS/MS
 
 ```{r fig6_S5B_data, include=FALSE}
-lcms_p_cutoff <- 0.01     # feature set: Kruskal-Wallis p <= this
+lcms_p_cutoff <- 0.01     # Kruskal-Wallis P
 lcms_n_perm   <- 9999     # PERMANOVA permutations
 lcms_n_boot   <- 1000     # pvclust bootstrap replicates
 
-lcms_host_pal <- c(HID07 = "#8dd3c7", HID08 = "#fdb462", HID16 = "#bebada",
-                   HID17 = "#b3de69", HID23 = "#f0e04d")
+lcms_host_pal <- c(HID07 = "#8dd3c7", HID08 = "#fdb462")
 lcms_inh_pal  <- c(Yes = "#6c8197", No = "#c0cad5")
 lcms_val_col  <- circlize::colorRamp2(c(-2, 0, 2), c("#4575B4", "#FFFFFF", "#D73027"))
 
-# raw sample column -> isolate (strip run/rep tags; pad NB numbers to 4 digits,
-# which also repairs the NB01046 typo)
 lcms_norm_iso <- function(x) {
   s <- sub("^X[0-9.]+_", "", x); s <- sub("_[A-Z]$", "", s)
   ifelse(grepl("^NB", s), sprintf("NB%04d", as.integer(sub("^NB0*", "", s))), s)
@@ -2050,12 +2045,11 @@ lcms_ticdf$mz <- lcms_ticdf$tic / max(lcms_ticdf$tic) * lcms_mztop * 0.95
 panel_6A <- ggplot() +
   geom_line(data = lcms_ticdf, aes(rt_min, mz, group = sample, color = inhibition),
             linewidth = 0.15, alpha = 0.5) +
-  geom_point(data = lcms_feat, aes(rt_min, mz, size = log2fc, alpha = neglog10p),
-             color = "#B00000", fill = "#B00000", shape = 21, stroke = 0.15) +
-  scale_color_manual(values = lcms_inh_pal, breaks = c("Yes", "No"), name = "Inhibitory") +
-  scale_radius(range = c(0.2, 4), name = expression(log[2]~"fold change")) +
-  scale_alpha_continuous(range = c(0.12, 0.9),
-                         name = expression(-log[10]~italic(P)*"-Value")) +
+  geom_point(data = lcms_feat, aes(rt_min, mz, size = log2fc),
+             color = "#B00000", fill = "#B00000", shape = 21, stroke = 0.15, alpha = 0.5) +
+  scale_color_manual(values = lcms_inh_pal, breaks = c("Yes", "No"), name = "Inhibition Z-Score ≥ 0") +
+  scale_radius(range = c(0.2, 4), limits = c(0, 15), breaks = c(0, 5, 10, 15),
+               name = expression(log[2]~"Fold Change")) +
   scale_x_continuous(expand = expansion(mult = c(0.01, 0.02))) +
   scale_y_continuous(expand = expansion(mult = c(0.01, 0.03))) +
   labs(x = "Retention Time (min)", y = expression(italic("m/z"))) +
@@ -2063,7 +2057,7 @@ panel_6A <- ggplot() +
   theme(legend.title = element_text(size = 10), legend.text = element_text(size = 9),
         legend.key = element_blank())
 
-lcms_fig_w <- 6.5; lcms_fig_h <- 8.5; lcms_rel_h <- c(1, 1.9); lcms_rel_w <- c(1, 0.3)
+lcms_fig_w <- 7; lcms_fig_h <- 8.5; lcms_rel_h <- c(1, 1.9); lcms_rel_w <- c(1, 0.22)
 lcms_plots_w <- lcms_fig_w * lcms_rel_w[1] / sum(lcms_rel_w)
 
 lcms_node_pos <- function(hc) {
@@ -2080,7 +2074,6 @@ dir.create("r_objects", showWarnings = FALSE)
 if (file.exists("r_objects/lcms_pvclust.rds")) {
   lcms_pv <- readRDS("r_objects/lcms_pvclust.rds")
 } else {
-  set.seed(8675309)   # pvclust bootstrap reproducibility
   lcms_pv <- pvclust(lcms_matz, method.dist = "euclidean", method.hclust = "complete",
                      nboot = lcms_n_boot, quiet = TRUE)
   saveRDS(lcms_pv, "r_objects/lcms_pvclust.rds")
@@ -2094,8 +2087,8 @@ lcms_left_mm <- convertWidth(sum(lcms_gA$widths[seq_len(min(lcms_pl$l) - 1)]), "
 invisible(dev.off()); unlink(lcms_tmp)
 
 lcms_topann <- HeatmapAnnotation(
-  HID = lcms_iso_meta$host, Inhibitory = lcms_iso_meta$inhibition,
-  col = list(HID = lcms_host_pal, Inhibitory = lcms_inh_pal),
+  HID = lcms_iso_meta$host, Inhibition = lcms_iso_meta$inhibition,
+  col = list(HID = lcms_host_pal, Inhibition = lcms_inh_pal),
   simple_anno_size = unit(6, "mm"), show_annotation_name = FALSE,
   show_legend = FALSE, gap = unit(1.5, "mm"))
 lcms_ht <- Heatmap(
@@ -2107,12 +2100,16 @@ lcms_ht <- Heatmap(
   heatmap_legend_param = list(direction = "horizontal"), border = TRUE)
 panel_6B <- grid.grabExpr({
   draw(lcms_ht, heatmap_legend_side = "bottom", show_annotation_legend = FALSE,
-       padding = unit(c(2, lcms_left_mm, 2, 2), "mm"))
+       padding = unit(c(2, lcms_left_mm, 2, 19), "mm"))
   decorate_column_dend("Feature Z-Score", {
     np <- lcms_node_pos(lcms_pv$hclust)
     grid.text(round(lcms_pv$edges$au * 100), x = unit(np$x, "native"), y = unit(np$y, "native"),
               just = c("center", "bottom"), gp = gpar(fontsize = 5.5, col = "black"))
   })
+  decorate_annotation("HID",
+    grid.text("HID", x = unit(1, "npc") + unit(1, "mm"), just = "left", gp = gpar(fontsize = 10, fontface = "bold")))
+  decorate_annotation("Inhibition",
+    grid.text("Inhibition", x = unit(1, "npc") + unit(1, "mm"), just = "left", gp = gpar(fontsize = 10, fontface = "bold")))
 }, width = lcms_plots_w, height = lcms_fig_h * lcms_rel_h[2] / sum(lcms_rel_h))
 
 lcms_legA <- get_legend(panel_6A + guides(color = "none") +
@@ -2122,13 +2119,14 @@ lcms_legB <- packLegend(
   Legend(title = "HID", labels = names(lcms_host_pal),
          legend_gp = gpar(fill = unname(lcms_host_pal)),
          title_gp = gpar(fontsize = 10, fontface = "bold"), labels_gp = gpar(fontsize = 9)),
-  Legend(title = "Inhibitory", labels = c("Yes", "No"),
+  Legend(title = "Inhibition\nZ-Score ≥ 0", labels = c("Yes", "No"),
          legend_gp = gpar(fill = unname(lcms_inh_pal[c("Yes", "No")])),
          title_gp = gpar(fontsize = 10, fontface = "bold"), labels_gp = gpar(fontsize = 9)),
   gap = unit(5, "mm"))
 lcms_legB_grob <- grid.grabExpr(draw(lcms_legB))
 
-lcms_plots_col <- plot_grid(panel_6A + theme(legend.position = "none"), panel_6B,
+lcms_plots_col <- plot_grid(panel_6A + theme(legend.position = "none",
+                              plot.margin = margin(5.5, 53.9, 5.5, 5.5, "pt")), panel_6B,
                             ncol = 1, labels = c("A", "B"), label_size = 12,
                             label_fontface = "bold", rel_heights = lcms_rel_h)
 lcms_legs_col  <- plot_grid(lcms_legA, lcms_legB_grob, ncol = 1, rel_heights = lcms_rel_h)
@@ -2648,11 +2646,8 @@ ggsave("figures/figure_S3.pdf", figure_S3,
 ### Figure S4
 
 ```{r fig_S4, include=FALSE}
-hid_bold_S4       <- c("HID23", "HID16", "HID7", "HID8", "HID17")
-isolate_hilite_S4 <- c("NB0108", "NB0203", "NB1111", "NB0883", "NB0049",
-                       "NB0184", "NB0017", "NB0078", "NB1046", "NB0219",
-                       "RSD0018", "NB0031", "NB0050", "NB0126", "NB0186",
-                       "NB1386")
+hid_bold_S4       <- c("HID7", "HID8")
+isolate_hilite_S4 <- c("NB0017", "NB0078", "NB1046", "NB0219", "RSD0018", "NB1386")
 
 hid_order_S4 <- pseudomonas_variable_isolates %>%
   arrange(desc(z_spread)) %>%
@@ -2702,7 +2697,6 @@ ggsave("figures/figure_S4.pdf", figure_S4,
 
 ### Figure S5B
 
-
 ```{r fig_S5B, include=FALSE}
 lcms_iso_sub <- t(apply(lcms_sub, 1, function(v) tapply(v, lcms_iso, mean)))
 lcms_iprof   <- t(lcms_iso_sub); lcms_iprof <- lcms_iprof / rowSums(lcms_iprof)
@@ -2710,7 +2704,6 @@ dir.create("r_objects", showWarnings = FALSE)
 if (file.exists("r_objects/lcms_permanova.rds")) {
   lcms_perm <- readRDS("r_objects/lcms_permanova.rds")
 } else {
-  set.seed(8675309)   # PERMANOVA permutation reproducibility
   lcms_perm <- adonis2(vegdist(lcms_iprof, "bray") ~ host + inhibition,
                        data = lcms_iso_meta, by = "margin", permutations = lcms_n_perm)
   saveRDS(lcms_perm, "r_objects/lcms_permanova.rds")
@@ -2727,20 +2720,13 @@ lcms_eff <- data.frame(
   F      = c(lcms_perm["host", "F"], lcms_perm["inhibition", "F"]),
   p      = c(lcms_perm["host", "Pr(>F)"], lcms_perm["inhibition", "Pr(>F)"]))
 
-# NMDS on per-injection profiles (Bray-Curtis, total-sum-scaled)
+# PCoA on per-injection profiles (Bray-Curtis, total-sum-scaled)
 lcms_sprof <- t(lcms_sub); lcms_sprof <- lcms_sprof / rowSums(lcms_sprof)
-if (file.exists("r_objects/lcms_nmds.rds")) {
-  lcms_mds <- readRDS("r_objects/lcms_nmds.rds")
-} else {
-  set.seed(1)
-  lcms_mds <- metaMDS(lcms_sprof, distance = "bray", k = 2, trymax = 200, trace = 0)
-  saveRDS(lcms_mds, "r_objects/lcms_nmds.rds")
-}
-lcms_mdsdf <- data.frame(lcms_samp_meta, NMDS1 = lcms_mds$points[, 1], NMDS2 = lcms_mds$points[, 2])
-lcms_lim   <- range(c(lcms_mdsdf$NMDS1, lcms_mdsdf$NMDS2))
-lcms_lim   <- lcms_lim + c(-0.05, 0.05) * diff(lcms_lim)
+lcms_pcoa  <- cmdscale(vegdist(lcms_sprof, "bray"), k = 2, eig = TRUE)
+lcms_pvar  <- round(100 * lcms_pcoa$eig[1:2] / sum(lcms_pcoa$eig[lcms_pcoa$eig > 0]), 1)
+lcms_mdsdf <- data.frame(lcms_samp_meta, PCoA1 = lcms_pcoa$points[, 1], PCoA2 = lcms_pcoa$points[, 2])
 
-figure_S5B <- ggplot(lcms_mdsdf, aes(NMDS1, NMDS2)) +
+figure_S5B <- ggplot(lcms_mdsdf, aes(PCoA1, PCoA2)) +
   stat_ellipse(aes(color = host, group = host), type = "t", linewidth = 0.4, show.legend = FALSE) +
   stat_ellipse(data = subset(lcms_mdsdf, inhibition == "Yes"), color = lcms_inh_pal[["Yes"]],
                type = "t", linetype = "22", linewidth = 1) +
@@ -2748,9 +2734,12 @@ figure_S5B <- ggplot(lcms_mdsdf, aes(NMDS1, NMDS2)) +
                type = "t", linetype = "22", linewidth = 1) +
   geom_point(aes(color = host, shape = inhibition), size = 3, stroke = 0.6) +
   scale_color_manual(values = lcms_host_pal, name = "HID") +
-  scale_shape_manual(values = c(Yes = 16, No = 17), name = "Inhibitory") +
-  labs(x = "NMDS1", y = "NMDS2") +
-  coord_fixed(1, xlim = lcms_lim, ylim = lcms_lim) + fig1_theme
+  scale_shape_manual(values = c(Yes = 16, No = 17), name = "Inhibition\nZ-Score ≥ 0") +
+  labs(x = sprintf("PCoA1 (%.1f%%)", lcms_pvar[1]), y = sprintf("PCoA2 (%.1f%%)", lcms_pvar[2])) +
+  coord_fixed(ratio = 1) + fig1_theme
+lcms_xy  <- do.call(rbind, lapply(ggplot_build(figure_S5B)$data, function(d) d[c("x", "y")]))
+lcms_lim <- range(lcms_xy, na.rm = TRUE); lcms_lim <- lcms_lim + c(-0.03, 0.03) * diff(lcms_lim)
+figure_S5B <- figure_S5B + coord_fixed(ratio = 1, xlim = lcms_lim, ylim = lcms_lim)
 
 dir.create("figures", showWarnings = FALSE)
 ggsave("figures/figure_S5B.pdf", figure_S5B, width = 6.5, height = 6.5, device = cairo_pdf)
