@@ -13,6 +13,8 @@ library(ComplexHeatmap)
 library(ComplexUpset)
 library(cowplot)
 library(ggtext)
+library(lme4)
+library(lmerTest)
 library(multcompView)
 library(parallel)
 library(parallelDist)
@@ -29,7 +31,6 @@ set.seed(8675309)
 ## Load Data
 
 ```{r load_data, include=FALSE}
-# --- primary metadata and assay data ---
 cf_microbiome_metadata <- read.csv("./rawData/16S_rRNA_gene_amplicon_studies/16S_CF_microbiome.csv")
 cf_isolates <- read_csv("./rawData/isolate_identification/isolate_identification.csv")
 bioassay_data <- read_csv("./rawData/cross-streak/cross-streak_inhibition_data.csv")
@@ -38,10 +39,8 @@ cf_pathogens <- c("Pseudomonas", "Staphylococcus", "Burkholderia",
                   "Stenotrophomonas", "Achromobacter", "Haemophilus",
                   "Escherichia")
 
-# --- 16S rRNA gene mothur taxonomy summaries ---
 files <- list.files("derivedData/mothur_output", pattern = "\\.tax\\.summary$", full.names = TRUE)
 
-# --- LC-MS/MS feature table and isolate metadata ---
 lcms_dir  <- file.path("rawData", "lcms", "overall")
 lcms_diff <- read_excel(file.path(lcms_dir, "XCMS-diffreport-MultiClass.xlsx"), sheet = 1)
 lcms_meta <- read_excel(file.path("rawData", "lcms", "pseudomonas_isolate_metadata.xlsx"), sheet = 1)
@@ -104,12 +103,25 @@ genus_matrix <- genus_matrix[,
   names(which(colSums(genus_matrix > 0) >= ceiling(0.01 * nrow(genus_matrix))))
 ]
 
-mean_abund     <- colMeans(sweep(genus_matrix, 1, rowSums(genus_matrix), "/"), na.rm = TRUE)
-prevalence_pct <- colSums(genus_matrix > 0) / nrow(genus_matrix) * 100
+table1_genera <- c("Streptococcus", "Pseudomonas", "Staphylococcus", "Prevotella",
+                   "Haemophilus", "Veillonella", "Rothia", "Stenotrophomonas",
+                   "Neisseria", "Granulicatella", "Achromobacter", "Gemella",
+                   "Porphyromonas", "Burkholderia", "Fusobacterium", "Actinomyces",
+                   "Schaalia", "Alloprevotella", "Escherichia")
 
-keep_genera <- names(mean_abund)[mean_abund * 100 > 0.5 & prevalence_pct >= 5]
+overall_rel_abund <- colSums(genus_matrix) / sum(genus_matrix) * 100
+prevalence_pct    <- colSums(genus_matrix > 0) / nrow(genus_matrix) * 100
+
+stopifnot(all(table1_genera %in% colnames(genus_matrix)))
+keep_genera <- table1_genera
 
 genus_matrix_filt <- genus_matrix[, keep_genera, drop = FALSE]
+
+# report the Table 1 quantities for the genera used
+print(data.frame(genus = keep_genera,
+                 overall_rel_abund = round(overall_rel_abund[keep_genera], 1),
+                 prevalence_pct    = round(prevalence_pct[keep_genera], 1),
+                 row.names = NULL))
 
 write.csv(genus_matrix_filt, "derivedData/genus_matrix_filt.csv")
 ```
@@ -155,7 +167,7 @@ metacommunity_table <- per_sample_ra %>%
     prev_01_pct       = round(n_prev_01 / n_samples * 100, 1),
     prev_1_pct        = round(n_prev_1  / n_samples * 100, 1),
     dominant_pct      = round(n_dominant / n_samples * 100, 1),
-    bloom_given_prev  = round(
+    conditional_dominance  = round(
       ifelse(n_prev_1 == 0, NA_real_, n_dominant / n_prev_1 * 100), 1),
     mean_ra_dom       = round(mean_ra_dom, 1),
     median_ra_dom     = round(median_ra_dom, 1),
@@ -167,7 +179,7 @@ metacommunity_table <- per_sample_ra %>%
     genus, metacommunity_ra,
     n_prev_01, prev_01_pct,
     n_prev_1,  prev_1_pct,
-    n_dominant, dominant_pct, bloom_given_prev,
+    n_dominant, dominant_pct, conditional_dominance,
     mean_ra, median_ra, range_ra,
     mean_ra_dom, median_ra_dom, range_ra_dom
   )
@@ -187,7 +199,7 @@ metacommunity_csv <- metacommunity_table %>%
     `Median RA % [IQR]`                = median_iqr,
     `Prevalence >=1% (%)`              = prev_1_pct,
     `Dominant (>50%) (%)`              = dominant_pct,
-    `Dominant given Prev >=1% (%)`     = bloom_given_prev,
+    `Dominant given Prev >=1% (%)`     = conditional_dominance,
     `Mean RA when Dominant (%)`        = mean_ra_dom,
     `Median RA when Dominant % [IQR]`  = median_iqr_dom
   )
@@ -195,34 +207,32 @@ metacommunity_csv <- metacommunity_table %>%
 write.csv(metacommunity_csv, "derivedData/table_metacommunity.csv", row.names = FALSE)
 ```
 
-## Bloom tests: pathogen vs oropharyngeal
+## Conditional dominance tests: pathogen vs oropharyngeal
 
 ```{r dominance_tests, include=FALSE}
-# prevalence (>=1%): sum(ra >= 1); dominance (>50%): sum(ra > 50);
-# bloom_rate: dominance / prevalence.
 metacommunity_genera <- metacommunity_table$genus
 
 per_sample_ra_lab <- per_sample_ra %>%
   filter(taxon %in% metacommunity_genera) %>%
   mutate(group = ifelse(taxon %in% cf_pathogens, "pathogen", "oropharyngeal"))
 
-bloom_rate_per_genus <- per_sample_ra_lab %>%
+conditional_dominance_per_genus <- per_sample_ra_lab %>%
   group_by(taxon, group) %>%
   summarize(n_prev_1   = sum(ra >= 1),
             n_dominant = sum(ra > 50),
             .groups    = "drop") %>%
   filter(n_prev_1 > 0) %>%
-  mutate(bloom_rate = n_dominant / n_prev_1 * 100)
+  mutate(conditional_dominance = n_dominant / n_prev_1 * 100)
 
-q1_wilcox <- wilcox.test(bloom_rate ~ group, data = bloom_rate_per_genus,
+q1_wilcox <- wilcox.test(conditional_dominance ~ group, data = conditional_dominance_per_genus,
                          exact = FALSE)
 print(q1_wilcox)
-bloom_rate_per_genus %>%
+conditional_dominance_per_genus %>%
   group_by(group) %>%
   summarize(n_genera    = n(),
-            median_rate = median(bloom_rate),
-            q25         = quantile(bloom_rate, 0.25),
-            q75         = quantile(bloom_rate, 0.75)) %>%
+            median_rate = median(conditional_dominance),
+            q25         = quantile(conditional_dominance, 0.25),
+            q75         = quantile(conditional_dominance, 0.75)) %>%
   print()
 
 dominant_obs <- per_sample_ra_lab %>% filter(ra > 50)
@@ -294,6 +304,7 @@ nmds_stress <- nmds$stress
 if (file.exists("r_objects/permanova_combined.rds")) {
   permanova_combined <- readRDS("r_objects/permanova_combined.rds")
 } else {
+  set.seed(8675309)
   N_PERM <- 9999
 
   bray_mat <- as.matrix(bray_dist)
@@ -325,7 +336,7 @@ if (file.exists("r_objects/permanova_combined.rds")) {
     lapply(partial_st_vars,
            function(v) list(type = "partial_brst",    variable = v)),
     list(list(type = "joint_technical",
-              variable = "BioProject + Region + Sample_Type"))
+              variable = "BioProject + Sample_Type"))
   )
 
   n_cores <- max(1, parallel::detectCores() - 1)
@@ -356,7 +367,7 @@ if (file.exists("r_objects/permanova_combined.rds")) {
       idx      <- keep_idx(meta, v)
       dist_sub <- as.dist(bray_mat[idx, idx])
       meta_sub <- meta[idx, , drop = FALSE]
-      f <- as.formula(paste("dist_sub ~ BioProject + Region +", v))
+      f <- as.formula(paste("dist_sub ~ BioProject +", v))
       environment(f) <- environment()
       res <- as.data.frame(adonis2(f, data = meta_sub,
                                    permutations = N_PERM, by = "margin"))
@@ -364,7 +375,7 @@ if (file.exists("r_objects/permanova_combined.rds")) {
       return(data.frame(variable = v, n = length(idx), Df = res$Df,
                         R2 = round(res$R2, 4), F = round(res$F, 3),
                         p.value = res[["Pr(>F)"]],
-                        model = "partial (| BioProject + Region)",
+                        model = "partial (| BioProject)",
                         row.names = NULL, check.names = FALSE))
     }
 
@@ -373,7 +384,7 @@ if (file.exists("r_objects/permanova_combined.rds")) {
       idx      <- idx[!is.na(meta$Sample_Type[idx]) & meta$Sample_Type[idx] != ""]
       dist_sub <- as.dist(bray_mat[idx, idx])
       meta_sub <- meta[idx, , drop = FALSE]
-      f <- as.formula(paste("dist_sub ~ BioProject + Region + Sample_Type +", v))
+      f <- as.formula(paste("dist_sub ~ BioProject + Sample_Type +", v))
       environment(f) <- environment()
       res <- as.data.frame(adonis2(f, data = meta_sub,
                                    permutations = N_PERM, by = "margin"))
@@ -381,7 +392,7 @@ if (file.exists("r_objects/permanova_combined.rds")) {
       return(data.frame(variable = v, n = length(idx), Df = res$Df,
                         R2 = round(res$R2, 4), F = round(res$F, 3),
                         p.value = res[["Pr(>F)"]],
-                        model = "partial (| BioProject + Region + Sample_Type)",
+                        model = "partial (| BioProject + Sample_Type)",
                         row.names = NULL, check.names = FALSE))
     }
 
@@ -390,7 +401,7 @@ if (file.exists("r_objects/permanova_combined.rds")) {
       dist_sub <- as.dist(bray_mat[idx, idx])
       meta_sub <- meta[idx, , drop = FALSE]
       res <- as.data.frame(adonis2(
-        dist_sub ~ BioProject + Region + Sample_Type,
+        dist_sub ~ BioProject + Sample_Type,
         data = meta_sub, permutations = N_PERM))
       res <- res["Model", , drop = FALSE]
       return(data.frame(variable = v, n = length(idx), Df = res$Df,
@@ -415,6 +426,7 @@ technical_joint_R2 <- permanova_combined$R2[permanova_combined$model == "joint t
 if (file.exists("r_objects/permanova_subsampling_summary.rds")) {
   permanova_subsampling_summary <- readRDS("r_objects/permanova_subsampling_summary.rds")
 } else {
+  set.seed(8675309)
   N_PERM_SUB <- 999
   N_REPS     <- 1000
   SUB_N      <- 100
@@ -700,10 +712,12 @@ interaction_df <- do.call(rbind, int_res) %>% filter(!is.na(bi))
 interaction_df$fdr_interaction <- p.adjust(interaction_df$pval_interaction, method = "BH")
 interaction_df$sig_interaction <- interaction_df$fdr_interaction < 0.05
 
-sig_taxa <- unique(c(interaction_df$genus1[interaction_df$sig_interaction],
-                     interaction_df$genus2[interaction_df$sig_interaction]))
-pa_matrix     <- (genus_matrix_filt[fev1_runs, sig_taxa, drop = FALSE] > 0) * 1
-n_interacting <- rowSums(pa_matrix)
+covar_pairs <- pairwise_results[pairwise_results$significant, c("genus1", "genus2")]
+sig_taxa    <- unique(c(covar_pairs$genus1, covar_pairs$genus2))
+
+pres_matrix   <- genus_matrix_filt[fev1_runs, , drop = FALSE] > 0
+n_interacting <- rowSums(pres_matrix[, covar_pairs$genus1, drop = FALSE] &
+                         pres_matrix[, covar_pairs$genus2, drop = FALSE])
 bioproject    <- fev1_meta$BioProject
 sample_type   <- fev1_meta$Sample_Type
 region        <- fev1_meta$Region
@@ -756,31 +770,321 @@ adj_stat_label <- paste0("italic(P)[adj] == ", adj_p,
                          "~~beta == '+'*", adj_coef, "*'%'~FEV[1]~Genus^-1")
 ```
 
+```{r interaction_helpers, include=FALSE}
+fit_region_pairs <- function(la) {
+  res <- data.frame(genus1 = pairs[1, ], genus2 = pairs[2, ],
+                    bx = NA_real_, r = NA_real_, pval = NA_real_,
+                    stringsAsFactors = FALSE)
+  for (k in seq_len(n_pairs)) {
+    y <- la[, pairs[1, k]]; x <- la[, pairs[2, k]]
+    if (sd(x) == 0 || sd(y) == 0) next          
+    fit <- lm(y ~ x)
+    res$bx[k]   <- coef(fit)[2]
+    res$r[k]    <- cor(x, y)
+    res$pval[k] <- summary(fit)$coefficients[2, 4]
+  }
+  res
+}
+
+ccc <- function(x, y) {
+  ok <- is.finite(x) & is.finite(y); x <- x[ok]; y <- y[ok]
+  2 * cov(x, y) / (var(x) + var(y) + (mean(x) - mean(y))^2)
+}
+```
+
 ## Alpha Diversity vs Interactions Effect Comparison
 
 ```{r alpha_vs_interactions_effect, include=FALSE}
-alpha_genus_vals <- alpha_adj %>%
-  dplyr::select(sample, shannon)
+effect_df <- bp_df[bp_complete, ]
+effect_df$shannon <- alpha_adj$shannon[match(effect_df$sample, alpha_adj$sample)]
+effect_df$n_int   <- n_interacting[match(effect_df$sample, fev1_runs)]
+effect_df <- effect_df[complete.cases(
+  effect_df[, c("FEV1", "bp_dom", "shannon", "n_int",
+                "Age", "BioProject", "Sample_Type")]), ]
 
-effect_df <- data.frame(
-  sample        = fev1_runs,
-  fev1          = fev1_vals,
-  n_interacting = n_interacting,
-  age           = as.numeric(fev1_meta$Age),
-  bioproject    = bioproject,
-  stringsAsFactors = FALSE
-) %>%
-  left_join(alpha_genus_vals, by = "sample") %>%
-  filter(!is.na(age), !is.na(shannon))
+effect_metrics <- c(n_int   = "Covarying associations",
+                    shannon = "Diversity",
+                    bp_dom  = "Dominance")
 
-effect_std   <- lm(fev1 ~ scale(shannon) + scale(n_interacting) + age + bioproject,
-                   data = effect_df)
-effect_std_s <- summary(effect_std)
-print(effect_std_s$coefficients[c("scale(shannon)", "scale(n_interacting)"), ])
+effect_std_tab <- do.call(rbind, lapply(names(effect_metrics), function(v) {
+  f <- as.formula(sprintf("FEV1 ~ scale(%s) + Age + BioProject + Sample_Type", v))
+  s <- summary(lm(f, data = effect_df))$coefficients[sprintf("scale(%s)", v), ]
+  data.frame(metric    = effect_metrics[[v]], variable = v,
+             b_std     = s[["Estimate"]], abs_b_std = abs(s[["Estimate"]]),
+             t         = s[["t value"]],  p         = s[["Pr(>|t|)"]],
+             stringsAsFactors = FALSE)
+}))
+effect_std_tab <- effect_std_tab[order(-effect_std_tab$abs_b_std), ]
+effect_n <- nrow(effect_df)
 
-bp_std_lm <- lm(FEV1 ~ scale(bp_dom) + Age + BioProject + Sample_Type + Region,
-                data = bp_df[bp_complete, ])
-print(summary(bp_std_lm)$coefficients["scale(bp_dom)", ])
+# Collinearity: why these are fit separately rather than jointly
+effect_cor  <- cor(effect_df[, c("bp_dom", "shannon", "n_int")])
+cor_dom_div <- effect_cor["bp_dom", "shannon"]
+
+print(effect_std_tab, row.names = FALSE, digits = 3)
+print(round(effect_cor, 3))
+sprintf("n = %d; dominance vs diversity r = %.2f", effect_n, cor_dom_div)
+```
+
+## Pseudoreplication and repeated sampling
+
+```{r pseudorep_setup, include=FALSE}
+reps_meta <- read.csv(
+  "rawData/16S_rRNA_gene_amplicon_studies/16S_CF_microbiome_with_reps_long.csv",
+  stringsAsFactors = FALSE, check.names = FALSE)
+reps_meta$indiv <- paste(reps_meta$BioProject, reps_meta$Sample_ID, sep = "|")
+
+run_indiv <- setNames(reps_meta$indiv, reps_meta$Run)
+run_bp    <- setNames(reps_meta$BioProject, reps_meta$Run)
+run_reads <- setNames(as.numeric(reps_meta$Bacterial_Read_Count), reps_meta$Run)
+
+runs_per_indiv <- table(reps_meta$indiv)
+class_counts   <- table(reps_meta$Sample_Class)
+repeated_sampling_summary <- data.frame(
+  quantity = c("Sequencing runs", "Unique individuals",
+               "Runs from repeat-sampled individuals (%)",
+               "Max runs per individual",
+               "Class: independent", "Class: longitudinal",
+               "Class: replicate", "Class: unresolved"),
+  value = c(nrow(reps_meta), length(runs_per_indiv),
+            round(100 * sum(runs_per_indiv[reps_meta$indiv] > 1) / nrow(reps_meta), 1),
+            max(runs_per_indiv),
+            as.integer(class_counts["independent"]), as.integer(class_counts["longitudinal"]),
+            as.integer(class_counts["replicate"]),   as.integer(class_counts["unresolved"])),
+  stringsAsFactors = FALSE)
+dir.create("tables", showWarnings = FALSE)
+print(repeated_sampling_summary)
+
+pick_one_per_indiv <- function(runs) {
+  runs <- runs[!is.na(run_indiv[runs])]
+  runs <- runs[order(run_indiv[runs], -run_reads[runs], runs)]
+  runs[!duplicated(run_indiv[runs])]
+}
+
+df2A <- data.frame(run = fev1_runs, FEV1 = fev1_vals, n_int = n_interacting,
+                   Age = as.numeric(fev1_meta$Age), BioProject = fev1_meta$BioProject,
+                   Sample_Type = fev1_meta$Sample_Type, Region = fev1_meta$Region,
+                   indiv = run_indiv[fev1_runs], stringsAsFactors = FALSE)
+
+full_b   <- pairwise_results$bx
+full_sig <- pairwise_results$significant
+concord_2b <- function(b_new) {
+  est <- is.finite(b_new)
+  c(signs    = 100 * mean(sign(b_new[full_sig & est]) == sign(full_b[full_sig & est])),
+    spearman = cor(full_b[est], b_new[est], method = "spearman"),
+    ccc      = ccc(full_b[est], b_new[est]))
+}
+```
+
+```{r pseudorep_mixed, include=FALSE}
+ab_mix <- alpha_adj; ab_mix$indiv <- run_indiv[ab_mix$sample]
+m1b <- lmer(shannon ~ FEV1_bin + Age + Sample_Type + Region + (1 | BioProject) + (1 | indiv),
+            data = ab_mix)
+p1B_mixed <- anova(m1b)["FEV1_bin", "Pr(>F)"]
+
+bp_mix <- bp_df; bp_mix$indiv <- run_indiv[bp_mix$sample]
+m1c <- lmer(FEV1 ~ bp_dom + Age + Sample_Type + Region + (1 | BioProject) + (1 | indiv),
+            data = bp_mix)
+c1C_mixed <- summary(m1c)$coefficients["bp_dom", c("Estimate", "Pr(>|t|)")]
+
+m2a <- lmer(FEV1 ~ n_int + Age + Sample_Type + Region + (1 | BioProject) + (1 | indiv),
+            data = df2A)
+c2A_mixed <- summary(m2a)$coefficients["n_int", c("Estimate", "Pr(>|t|)")]
+
+dir.create("r_objects", showWarnings = FALSE)
+pseudo2b_rds <- "r_objects/pseudorep_2B_mixed.rds"
+if (file.exists(pseudo2b_rds)) {
+  b2b_mixed <- readRDS(pseudo2b_rds)
+} else {
+  bpv <- run_bp[rownames(log_abund)]; idv <- run_indiv[rownames(log_abund)]
+  b2b_mixed <- data.frame(bx = rep(NA_real_, n_pairs), pval = rep(NA_real_, n_pairs))
+  for (k in seq_len(n_pairs)) {
+    d <- data.frame(y = log_abund[, pairs[1, k]], x = log_abund[, pairs[2, k]],
+                    bp = bpv, id = idv)
+    m <- tryCatch(suppressWarnings(lmer(y ~ x + (1 | bp) + (1 | id), data = d)),
+                  error = function(e) NULL)
+    if (!is.null(m)) {
+      co <- summary(m)$coefficients
+      if ("x" %in% rownames(co)) { b2b_mixed$bx[k] <- co["x", "Estimate"]
+                                   b2b_mixed$pval[k] <- co["x", "Pr(>|t|)"] }
+    }
+  }
+  saveRDS(b2b_mixed, pseudo2b_rds)
+}
+conc2B_mixed <- concord_2b(b2b_mixed$bx)
+```
+
+```{r pseudorep_restrict, include=FALSE}
+RA_all <- sweep(mat_genus, 1, rowSums(mat_genus), "/") * 100
+gg_1A  <- intersect(metacommunity_genera, colnames(RA_all))
+RA_all <- RA_all[, gg_1A, drop = FALSE]
+prev_f  <- function(M) colSums(M >= 1) / nrow(M) * 100
+dom_f   <- function(M) colSums(M >  50) / nrow(M) * 100
+conditional_dominance_f <- function(M) { np <- colSums(M >= 1); nd <- colSums(M > 50)
+                         ifelse(np == 0, NA_real_, nd / np * 100) }
+RA_dd  <- RA_all[pick_one_per_indiv(rownames(RA_all)), , drop = FALSE]
+r1A_prev  <- cor(prev_f(RA_all),  prev_f(RA_dd))
+r1A_dom   <- cor(dom_f(RA_all),   dom_f(RA_dd))
+r1A_conditional_dominance <- cor(conditional_dominance_f(RA_all), conditional_dominance_f(RA_dd), use = "complete.obs")
+
+dd1B <- pick_one_per_indiv(alpha_adj$sample)
+p1B_full     <- kruskal.test(shannon_adj ~ FEV1_bin, data = alpha_adj)$p.value
+p1B_restrict <- kruskal.test(shannon_adj ~ FEV1_bin,
+                             data = alpha_adj[alpha_adj$sample %in% dd1B, ])$p.value
+
+f1C <- FEV1 ~ bp_dom + Age + BioProject + Sample_Type + Region
+c1C_full     <- summary(lm(f1C, data = bp_df))$coefficients["bp_dom", c("Estimate", "Pr(>|t|)")]
+dd1C <- pick_one_per_indiv(bp_df$sample)
+c1C_restrict <- summary(lm(f1C, data = bp_df[bp_df$sample %in% dd1C, ]))$coefficients["bp_dom", c("Estimate", "Pr(>|t|)")]
+
+f2A <- FEV1 ~ n_int + Age + BioProject + Sample_Type + Region
+c2A_full     <- summary(lm(f2A, data = df2A))$coefficients["n_int", c("Estimate", "Pr(>|t|)")]
+dd2A <- pick_one_per_indiv(df2A$run)
+c2A_restrict <- summary(lm(f2A, data = df2A[df2A$run %in% dd2A, ]))$coefficients["n_int", c("Estimate", "Pr(>|t|)")]
+
+dd2B <- pick_one_per_indiv(rownames(log_abund))
+rr2B <- fit_region_pairs(log_abund[dd2B, , drop = FALSE])
+conc2B_restrict <- concord_2b(rr2B$bx)
+```
+
+```{r pseudorep_summary, include=FALSE}
+fmt_p <- function(p) {
+  if (is.na(p)) return("NA")
+  if (p < 1e-15) return("<1e-15")
+  if (p < 1e-4)  return(formatC(p, format = "e", digits = 1))
+  formatC(p, format = "g", digits = 2)
+}
+
+pseudorep_summary <- data.frame(
+  Panel = c("1A", "1B", "1C", "2A", "2B"),
+  Analysis = c("Prevalence / dominance / conditional dominance per genus",
+               "Alpha diversity vs FEV1 bin",
+               "Berger-Parker dominance vs FEV1",
+               "Interacting genera vs FEV1",
+               "Pairwise genus co-occurrence"),
+  Full = c("descriptive",
+           paste0("KW p=", fmt_p(p1B_full)),
+           sprintf("b=%.1f, p=%s", c1C_full["Estimate"], fmt_p(c1C_full["Pr(>|t|)"])),
+           sprintf("b=%.2f, p=%s", c2A_full["Estimate"], fmt_p(c2A_full["Pr(>|t|)"])),
+           sprintf("%d sig pairs", sum(full_sig))),
+  Mixed_model = c("n/a (descriptive)",
+                  paste0("FEV1 term p=", fmt_p(p1B_mixed)),
+                  sprintf("b=%.1f, p=%s", c1C_mixed["Estimate"], fmt_p(c1C_mixed["Pr(>|t|)"])),
+                  sprintf("b=%.2f, p=%s", c2A_mixed["Estimate"], fmt_p(c2A_mixed["Pr(>|t|)"])),
+                  sprintf("signs %.0f%%, CCC %.2f", conc2B_mixed["signs"], conc2B_mixed["ccc"])),
+  Independent_individuals = c(sprintf("r=%.2f/%.2f/%.2f", r1A_prev, r1A_dom, r1A_conditional_dominance),
+                  paste0("KW p=", fmt_p(p1B_restrict)),
+                  sprintf("b=%.1f, p=%s", c1C_restrict["Estimate"], fmt_p(c1C_restrict["Pr(>|t|)"])),
+                  sprintf("b=%.2f, p=%s", c2A_restrict["Estimate"], fmt_p(c2A_restrict["Pr(>|t|)"])),
+                  sprintf("signs %.0f%%, CCC %.2f", conc2B_restrict["signs"], conc2B_restrict["ccc"])),
+  stringsAsFactors = FALSE)
+
+dir.create("tables", showWarnings = FALSE)
+print(pseudorep_summary)
+```
+
+## Tables S2 and S3
+
+```{r tables_S2_S3, include=FALSE}
+S2_VARS <- c("Sample_Type", "Age", "Sex", "FEV1")
+S2_PERM <- 999
+S2_SEED <- 8675309
+
+s2_fit <- function() {
+  bm <- as.matrix(bray_dist)
+  m  <- cf_microbiome_metadata[match(rownames(bm), cf_microbiome_metadata$Run), ]
+  rownames(m) <- rownames(bm)
+  for (v in c("Sex", "Sample_Type", "Region", "Instrument"))
+    if (!is.null(m[[v]])) m[[v]][!is.na(m[[v]]) & trimws(m[[v]]) == ""] <- NA
+  m$Age  <- suppressWarnings(as.numeric(m$Age))
+  m$FEV1 <- suppressWarnings(as.numeric(m$FEV1))
+  cc  <- function(vs) rownames(m)[Reduce(`&`, lapply(vs, function(v) !is.na(m[[v]])))]
+  one <- pick_one_per_indiv(rownames(bm))
+
+  fit <- function(runs, rhs, keep) {
+    d <- as.dist(bm[runs, runs]); dat <- m[runs, , drop = FALSE]
+    f <- as.formula(paste("d ~", rhs)); environment(f) <- environment()
+    set.seed(S2_SEED)
+    r <- as.data.frame(adonis2(f, data = dat, permutations = S2_PERM, by = "margin"))
+    data.frame(term = keep, n = length(runs), R2 = r[keep, "R2"], p = r[keep, "Pr(>F)"])
+  }
+  hl <- do.call(rbind, lapply(S2_VARS, function(v) {
+    rhs  <- if (v == "Sample_Type") "BioProject + Sample_Type"
+            else paste("BioProject + Sample_Type +", v)
+    runs <- cc(unique(c("Sample_Type", v)))
+    a <- fit(runs, rhs, v); b <- fit(intersect(runs, one), rhs, v)
+    data.frame(term = v, n_all = a$n, R2_all = a$R2, p_all = a$p,
+               n_one = b$n, R2_one = b$R2, p_one = b$p)
+  }))
+
+  ps <- do.call(rbind, unlist(lapply(S2_VARS, function(v)
+    lapply(unique(m$BioProject), function(bp) {
+      runs <- rownames(m)[m$BioProject == bp & !is.na(m[[v]])]
+      if (length(runs) < 20 || length(unique(m[runs, v])) < 2) return(NULL)
+      d <- as.dist(bm[runs, runs]); dat <- m[runs, , drop = FALSE]
+      f <- as.formula(paste("d ~", v)); environment(f) <- environment()
+      set.seed(S2_SEED)
+      r <- tryCatch(as.data.frame(adonis2(f, data = dat, permutations = S2_PERM)),
+                    error = function(e) NULL)
+      if (is.null(r)) return(NULL)
+      x <- dat[[v]]
+      if (is.numeric(x)) {
+        rho <- suppressWarnings(cor(as.vector(d), as.vector(stats::dist(x)),
+                                    method = "spearman"))
+      } else {
+        m2 <- as.matrix(d); same <- outer(x, x, "=="); ut <- upper.tri(m2)
+        rho <- mean(m2[ut & !same]) - mean(m2[ut & same])
+      }
+      data.frame(variable = v, n = length(runs), p = r[1, "Pr(>F)"],
+                 direction_rho = rho)
+    })), recursive = FALSE))
+  list(headline = hl, perstudy = ps)
+}
+
+s2_cached <- c("r_objects/permanova_C3b_pervar.rds",
+               "r_objects/permanova_E1_one_per_indiv.rds",
+               "r_objects/permanova_G_perstudy.rds")
+if (all(file.exists(s2_cached))) {
+  s2_c3b <- readRDS(s2_cached[1])
+  s2_e1  <- readRDS(s2_cached[2]); s2_e1 <- s2_e1[grepl("^E1 C3b", s2_e1$model), ]
+  s2_hl  <- do.call(rbind, lapply(S2_VARS, function(v) {
+    a <- s2_c3b[s2_c3b$term == v, ][1, ]; b <- s2_e1[s2_e1$term == v, ][1, ]
+    data.frame(term = v, n_all = a$n, R2_all = a$R2, p_all = a$p,
+               n_one = b$n, R2_one = b$R2, p_one = b$p)
+  }))
+  s2_ps <- readRDS(s2_cached[3])
+} else {
+  s2_obj <- s2_fit()
+  s2_hl  <- s2_obj$headline
+  s2_ps  <- s2_obj$perstudy
+  saveRDS(s2_hl, "r_objects/tables_S2_headline.rds")
+  saveRDS(s2_ps, "r_objects/tables_S3_perstudy.rds")
+}
+s2_ps$p_adj <- ave(s2_ps$p, s2_ps$variable, FUN = function(p) p.adjust(p, method = "BH"))
+
+dir.create("tables", showWarnings = FALSE)
+table_S2 <- data.frame(
+  Variable              = s2_hl$term,
+  N_all                 = s2_hl$n_all,
+  R2_all                = round(s2_hl$R2_all, 4),
+  P_all                 = signif(s2_hl$p_all, 2),
+  N_one_per_individual  = s2_hl$n_one,
+  R2_one_per_individual = round(s2_hl$R2_one, 4),
+  P_one_per_individual  = signif(s2_hl$p_one, 2))
+write.csv(table_S2, file.path("tables", "Table_S2_permanova.csv"), row.names = FALSE)
+
+table_S3 <- do.call(rbind, lapply(S2_VARS, function(v) {
+  d <- s2_ps[s2_ps$variable == v, ]
+  data.frame(Variable = v, Studies = nrow(d),
+             `Significant (BH P < 0.05)` = sum(d$p_adj < 0.05, na.rm = TRUE),
+             `Fraction agreeing` = round(max(mean(d$direction_rho > 0, na.rm = TRUE),
+                                             mean(d$direction_rho < 0, na.rm = TRUE)), 2),
+             check.names = FALSE)
+}))
+write.csv(table_S3, file.path("tables", "Table_S3_perstudy.csv"), row.names = FALSE)
+
+print(table_S2, row.names = FALSE)
+print(table_S3, row.names = FALSE)
 ```
 
 ## Process Bioassay Data
@@ -912,7 +1216,6 @@ total_inhibition_per_isolate <- total_inhibition_per_isolate %>%
   ) %>%
   dplyr::select(-.sd_all, -.mn_all)
 
-# order both figures by decreasing median z_overall from Fig 4B
 median_order <- total_inhibition_per_isolate %>%
   group_by(genus) %>%
   summarize(med = median(z_overall, na.rm = TRUE), .groups = "drop") %>%
@@ -1016,11 +1319,8 @@ names(kw_pvec) <- paste(rownames(kw_pmat)[kw_idx[, "row"]],
 
 kw_letters <- multcompView::multcompLetters(kw_pvec, threshold = 0.05)
 
-# remap so "a" belongs to the first genus in x-axis order
 genus_order_kw <- levels(total_inhibition_per_isolate$genus)
 raw_kw   <- kw_letters$Letters[genus_order_kw]
-# build mapping from individual component letters (not whole patterns),
-# in the order they first appear across genera left-to-right
 chars_in_order <- unique(unlist(strsplit(raw_kw, "")))
 lmap_kw  <- setNames(letters[seq_along(chars_in_order)], chars_in_order)
 kw_letters_df <- data.frame(
@@ -1056,12 +1356,13 @@ pseudomonas_variable_isolates <- total_inhibition_per_isolate %>%
 
 ## LC-MS/MS
 
-```{r fig6_S5B_data, include=FALSE}
-lcms_p_cutoff <- 0.01     # Kruskal-Wallis P
-lcms_n_perm   <- 9999     # PERMANOVA permutations
-lcms_n_boot   <- 1000     # pvclust bootstrap replicates
+```{r fig7_S7B_data, include=FALSE}
+lcms_p_cutoff <- 0.01     
+lcms_n_perm   <- 9999     
+lcms_n_boot   <- 1000     
 
-lcms_host_pal <- c(HID07 = "#8dd3c7", HID08 = "#fdb462")
+lcms_host_pal <- c(HID07 = "#7570B3", HID08 = "#fdb462ff", HID16 = "#bebada",
+                   HID17 = "#b3de69", HID23 = "#f0e04d")
 lcms_inh_pal  <- c(Yes = "#6c8197", No = "#c0cad5")
 lcms_val_col  <- circlize::colorRamp2(c(-2, 0, 2), c("#4575B4", "#FFFFFF", "#D73027"))
 
@@ -1092,6 +1393,7 @@ rownames(lcms_samp_meta) <- lcms_samp_meta$sample
 lcms_iso_meta <- lcms_meta %>%
   filter(isolate %in% colnames(lcms_iso_raw)) %>%
   arrange(match(isolate, colnames(lcms_iso_raw))) %>% as.data.frame()
+lcms_host_pal <- lcms_host_pal[names(lcms_host_pal) %in% lcms_iso_meta$host]
 
 # per-feature z-scored log2 isolate-mean matrix
 lcms_zscore <- function(m) { z <- t(scale(t(m))); z[!is.finite(z)] <- 0; z }
@@ -1120,7 +1422,6 @@ gg_theme <- theme_classic() +
     legend.title = element_blank()
   )
 
-# Force the data panel to a fixed physical size; accepts ggplot or gtable
 fix_panel_size <- function(p, w = unit(3.129, "in"), h = unit(3.129, "in")) {
   g <- if (inherits(p, "ggplot")) ggplotGrob(p) else p
   idx <- which(g$layout$name == "panel")
@@ -1156,6 +1457,10 @@ fig1_pathogen_order <- c("Pseudomonas", "Stenotrophomonas", "Burkholderia",
 pathogen_in_table <- fig1_pathogen_order[fig1_pathogen_order %in% metacommunity_genera]
 oro_in_table      <- sort(metacommunity_genera[!metacommunity_genera %in% cf_pathogens])
 fig1_genus_order  <- c(pathogen_in_table, oro_in_table)
+
+# shared age-group palette (used by Figs 1B and 2A); youngest group is green
+age_base_cols <- setNames(c("#009E73", "#CC79A7", "#4575B4", "#56B4E9", "gray60"),
+                          c("0–11", "12–17", "18–39", "40+", "NA"))
 ```
 
 ### Figure 1A
@@ -1173,7 +1478,7 @@ n_samp_1A <- nrow(ra_mat_1A)
 
 prev_fn_1A  <- function(M) colSums(M >= 1)  / nrow(M) * 100
 dom_fn_1A   <- function(M) colSums(M >  50) / nrow(M) * 100
-bloom_fn_1A <- function(M) {
+conditional_dominance_fn_1A <- function(M) {
   np <- colSums(M >= 1); nd <- colSums(M > 50)
   ifelse(np == 0, NA_real_, nd / np * 100)
 }
@@ -1182,13 +1487,13 @@ boot_arr_1A <- array(
   NA_real_,
   dim = c(N_BOOT_1A, ncol(ra_mat_1A), 3),
   dimnames = list(NULL, colnames(ra_mat_1A),
-                  c("prev_1_pct", "dominant_pct", "bloom_given_prev"))
+                  c("prev_1_pct", "dominant_pct", "conditional_dominance"))
 )
 for (b in seq_len(N_BOOT_1A)) {
   Mb <- ra_mat_1A[sample.int(n_samp_1A, n_samp_1A, replace = TRUE), , drop = FALSE]
   boot_arr_1A[b, , "prev_1_pct"]       <- prev_fn_1A(Mb)
   boot_arr_1A[b, , "dominant_pct"]     <- dom_fn_1A(Mb)
-  boot_arr_1A[b, , "bloom_given_prev"] <- bloom_fn_1A(Mb)
+  boot_arr_1A[b, , "conditional_dominance"] <- conditional_dominance_fn_1A(Mb)
 }
 ci_lo_1A <- apply(boot_arr_1A, c(2, 3), quantile, probs = 0.025, na.rm = TRUE)
 ci_hi_1A <- apply(boot_arr_1A, c(2, 3), quantile, probs = 0.975, na.rm = TRUE)
@@ -1198,29 +1503,29 @@ ci_long_1A <- bind_rows(
          lo = ci_lo_1A[, "prev_1_pct"], hi = ci_hi_1A[, "prev_1_pct"]),
   tibble(genus = rownames(ci_lo_1A), metric = "dominant_pct",
          lo = ci_lo_1A[, "dominant_pct"], hi = ci_hi_1A[, "dominant_pct"]),
-  tibble(genus = rownames(ci_lo_1A), metric = "bloom_given_prev",
-         lo = ci_lo_1A[, "bloom_given_prev"], hi = ci_hi_1A[, "bloom_given_prev"])
+  tibble(genus = rownames(ci_lo_1A), metric = "conditional_dominance",
+         lo = ci_lo_1A[, "conditional_dominance"], hi = ci_hi_1A[, "conditional_dominance"])
 )
 
 metric_cols <- c(
   "Prevalence (\u22651% Relative Abundance)" = "#c0cad5",
   "Dominance (>50% Relative Abundance)"      = "#6c8197",
-  "Bloom Rate (Dominance/Prevalence)"        = "#94a8bf"
+  "Conditional Dominance (Dominance/Prevalence)"        = "#94a8bf"
 )
 
 plot_df_1A <- metacommunity_table %>%
-  dplyr::select(genus, prev_1_pct, dominant_pct, bloom_given_prev) %>%
-  pivot_longer(cols = c(prev_1_pct, dominant_pct, bloom_given_prev),
+  dplyr::select(genus, prev_1_pct, dominant_pct, conditional_dominance) %>%
+  pivot_longer(cols = c(prev_1_pct, dominant_pct, conditional_dominance),
                names_to = "metric", values_to = "value") %>%
   left_join(ci_long_1A, by = c("genus", "metric")) %>%
   mutate(
     metric = recode(metric,
                     prev_1_pct       = "Prevalence (\u22651% Relative Abundance)",
                     dominant_pct     = "Dominance (>50% Relative Abundance)",
-                    bloom_given_prev = "Bloom Rate (Dominance/Prevalence)"),
+                    conditional_dominance = "Conditional Dominance (Dominance/Prevalence)"),
     metric = factor(metric, levels = c("Prevalence (\u22651% Relative Abundance)",
                                        "Dominance (>50% Relative Abundance)",
-                                       "Bloom Rate (Dominance/Prevalence)")),
+                                       "Conditional Dominance (Dominance/Prevalence)")),
     genus  = factor(genus, levels = fig1_genus_order)
   )
 
@@ -1262,64 +1567,50 @@ panel_1a <- ggplot(plot_df_1A, aes(x = genus, y = value, fill = metric)) +
 ### Figure 1B
 
 ```{r fig_1B, include=FALSE}
-fev1_bin_order <- c("Mild", "Moderate", "Severe", "Very Severe")
-fev1_bin_cols <- c("Mild" = "#4575B4", "Moderate" = "#ABD9E9",
-                   "Severe" = "#FDAE61", "Very Severe" = "#D73027")
-fev1_bin_labels_num <- c("Mild" = paste0("\u2265", "80"), "Moderate" = "50-79",
-                         "Severe" = "30-49", "Very Severe" = "<30")
+set.seed(8675309)
 
-alpha_genus <- alpha_adj %>%
-  mutate(FEV1_bin = factor(FEV1_bin, levels = fev1_bin_order))
+alpha_cont <- alpha_adj
+alpha_cont$FEV1 <- as.numeric(alpha_cont$FEV1)
+alpha_cont$Age  <- as.numeric(alpha_cont$Age)
+alpha_cont <- alpha_cont[!is.na(alpha_cont$FEV1) &
+                         !is.na(alpha_cont$shannon) &
+                         !is.na(alpha_cont$Age), ]
 
-pw_genus <- pairwise.wilcox.test(alpha_genus$shannon_adj, alpha_genus$FEV1_bin,
-                                  p.adjust.method = "BH", exact = FALSE)
-pw_pmat <- pw_genus$p.value
-pw_idx  <- which(!is.na(pw_pmat), arr.ind = TRUE)
-pw_pvec <- pw_pmat[pw_idx]
-names(pw_pvec) <- paste(rownames(pw_pmat)[pw_idx[, "row"]],
-                        colnames(pw_pmat)[pw_idx[, "col"]], sep = "-")
-alpha_letters <- multcompLetters(pw_pvec, threshold = 0.05)
-raw_letters <- alpha_letters$Letters[fev1_bin_order]
-unique_raw  <- unique(raw_letters)
-letter_map  <- setNames(letters[seq_along(unique_raw)], unique_raw)
-alpha_letters_df <- data.frame(
-  FEV1_bin = fev1_bin_order,
-  letter   = unname(sapply(raw_letters, function(l) {
-    paste(sort(letter_map[strsplit(l, "")[[1]]]), collapse = "")
-  }))
-)
+alpha_cont$FEV1_adj <- residuals(
+  lm(FEV1 ~ Age + BioProject + Sample_Type + Region, data = alpha_cont)) +
+  mean(alpha_cont$FEV1)
 
-letter_pos <- alpha_genus %>%
-  group_by(FEV1_bin) %>%
-  summarize(y = max(shannon_adj, na.rm = TRUE) + 0.15, .groups = "drop") %>%
-  left_join(alpha_letters_df, by = "FEV1_bin")
+alpha_cont$age_bin <- cut(alpha_cont$Age, breaks = c(-Inf, 12, 18, 40, Inf),
+                          right = FALSE, labels = c("0\u201311", "12\u201317", "18\u201339", "40+"))
+age_bins_1b <- levels(alpha_cont$age_bin)[table(alpha_cont$age_bin) > 0]
+age_n_1b    <- table(alpha_cont$age_bin)[age_bins_1b]
+age_lab_1b  <- setNames(paste0(age_bins_1b, " (N=", age_n_1b, ")"), age_bins_1b)
+alpha_cont$age_group <- factor(age_lab_1b[as.character(alpha_cont$age_bin)],
+                               levels = age_lab_1b[age_bins_1b])
+cols_1b <- setNames(unname(age_base_cols[age_bins_1b]), age_lab_1b[age_bins_1b])
 
-n_per_bin <- alpha_genus %>%
-  count(FEV1_bin) %>%
-  mutate(label = paste0(fev1_bin_labels_num[as.character(FEV1_bin)],
-                        "\n(N=", n, ")"))
-bin_labels <- setNames(n_per_bin$label, n_per_bin$FEV1_bin)
+n_boot_1b <- 100; n_1b <- nrow(alpha_cont)
+boot_lines_1b <- do.call(rbind, lapply(seq_len(n_boot_1b), function(b) {
+  bi  <- sample.int(n_1b, n_1b, replace = TRUE)
+  fit <- lm(alpha_cont$FEV1_adj[bi] ~ alpha_cont$shannon[bi])
+  data.frame(x = range(alpha_cont$shannon),
+             y = coef(fit)[1] + coef(fit)[2] * range(alpha_cont$shannon), boot = b)
+}))
 
-panel_2a_outliers <- alpha_genus %>%
-  group_by(FEV1_bin) %>%
-  mutate(.q1 = quantile(shannon_adj, 0.25, na.rm = TRUE),
-         .q3 = quantile(shannon_adj, 0.75, na.rm = TRUE),
-         .iqr = .q3 - .q1) %>%
-  filter(shannon_adj < .q1 - 1.5 * .iqr | shannon_adj > .q3 + 1.5 * .iqr) %>%
-  ungroup()
-
-panel_2a <- ggplot(alpha_genus, aes(x = shannon_adj, y = FEV1_bin, fill = FEV1_bin)) +
-  geom_boxplot(alpha = 0.7, notch = TRUE, outlier.shape = NA) +
-  geom_point(data = panel_2a_outliers, aes(fill = FEV1_bin),
-             shape = 21, color = "black", stroke = 0.2,
-             size = 1, alpha = 0.85) +
-  geom_text(data = letter_pos, aes(x = y, y = FEV1_bin, label = letter),
-            inherit.aes = FALSE, size = 3) +
-  scale_fill_manual(values = fev1_bin_cols, guide = "none") +
-  scale_y_discrete(limits = rev(fev1_bin_order), labels = bin_labels) +
-  labs(y = expression(Lung~Function~"("*FEV[1]~pp*")"),
-       x = expression(Diversity~"("*italic(H)*"'"[Adj]*")")) +
-  fig1_theme
+panel_1b <- ggplot(alpha_cont, aes(x = shannon, y = FEV1_adj)) +
+  geom_line(data = boot_lines_1b, aes(x = x, y = y, group = boot),
+            color = "lightblue", alpha = 0.15) +
+  geom_point(aes(color = age_group), alpha = 0.4, size = 1.5) +
+  geom_smooth(method = "lm", color = "#4575B4", se = FALSE, linewidth = 1.1) +
+  scale_color_manual(values = cols_1b, name = "Age") +
+  labs(x = expression(Diversity~"("*italic(H)*"'"*")"),
+       y = expression(Lung~Function~"("*FEV[1]~pp[Adj]*")")) +
+  fig1_theme +
+  theme(legend.position = "bottom",
+        legend.text  = element_text(size = 10),
+        legend.title = element_text(size = 10, face = "bold")) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE,
+                              override.aes = list(alpha = 1, size = 2)))
 ```
 
 ### Figure 1C
@@ -1341,7 +1632,7 @@ dom_type_labels <- setNames(
 )
 dom_type_cols <- c("Pathogen" = "#E69F00", "Oropharyngeal" = "gray60")
 
-panel_2b <- ggplot(bp_plot_df, aes(x = bp_dom, y = FEV1_adj)) +
+panel_1c <- ggplot(bp_plot_df, aes(x = bp_dom, y = FEV1_adj)) +
   geom_line(data = boot_lines_bp, aes(x = x, y = y, group = boot),
             color = "lightpink", alpha = 0.15) +
   geom_vline(xintercept = 0.5, linetype = "dashed",
@@ -1377,8 +1668,8 @@ pad_to_height <- function(g, target_h_in) {
   g
 }
 
-# Extract 1C legend
-leg_1c <- cowplot::get_legend(panel_2b)
+leg_1b <- cowplot::get_legend(panel_1b)
+leg_1c <- cowplot::get_legend(panel_1c)
 
 fix_panel_size_grob <- function(g, w, h) {
   panels <- g$layout[g$layout$name == "panel", ]
@@ -1389,11 +1680,11 @@ fix_panel_size_grob <- function(g, w, h) {
   g
 }
 
-panel_2a_gg <- panel_2a + labs(tag = "B") +
+panel_1b_gg <- panel_1b + labs(tag = "B") +
   theme(legend.position = "none", aspect.ratio = NULL,
         plot.tag = element_text(size = 12, face = "bold"))
 
-panel_2b_gg <- panel_2b + labs(tag = "C") +
+panel_1c_gg <- panel_1c + labs(tag = "C") +
   theme(legend.position = "none", aspect.ratio = NULL,
         plot.tag = element_text(size = 12, face = "bold"))
 
@@ -1401,7 +1692,7 @@ panel_1a_gg <- panel_1a + labs(tag = "A") +
   theme(plot.tag    = element_text(size = 12, face = "bold"),
         plot.margin = margin(b = 30, unit = "pt"))
 
-al_lr        <- cowplot::align_plots(panel_1a_gg, panel_2a_gg, panel_2b_gg,
+al_lr        <- cowplot::align_plots(panel_1a_gg, panel_1b_gg, panel_1c_gg,
                                       align = "v", axis = "lr")
 panel_1a_al  <- al_lr[[1]]
 
@@ -1415,53 +1706,18 @@ panel_1b_padded <- pad_to_height(panel_1b_sized, bc_hmax)
 panel_1c_padded <- pad_to_height(panel_1c_sized, bc_hmax)
 
 bc_top  <- cowplot::plot_grid(panel_1b_padded, panel_1c_padded, ncol = 2)
-bc_legs <- cowplot::plot_grid(NULL, leg_1c, ncol = 2)
-bc_row  <- cowplot::plot_grid(bc_top, bc_legs, ncol = 1, rel_heights = c(1, 0.18))
+bc_legs <- cowplot::plot_grid(leg_1b, leg_1c, ncol = 2)
+bc_row  <- cowplot::plot_grid(bc_top, bc_legs, ncol = 1, rel_heights = c(1, 0.26))
 
-figure_1 <- cowplot::plot_grid(panel_1a_al, bc_row, ncol = 1, rel_heights = c(1, 1))
+figure_1 <- cowplot::plot_grid(panel_1a_al, bc_row, ncol = 1, rel_heights = c(1, 1.2))
 
 dir.create("figures", showWarnings = FALSE)
-ggsave("figures/figure_1.pdf", figure_1, units = "in", width = 9, height = 8, device = cairo_pdf)
+ggsave("figures/figure_1.pdf", figure_1, units = "in", width = 9, height = 9, device = cairo_pdf)
 ```
 
 ### Figure 2A
 
 ```{r fig_2A, include=FALSE}
-age_levels  <- age_label_map[age_levels_raw]
-color_vals <- setNames(c("#E69F00", "#CC79A7", "#4575B4", "#56B4E9", "gray60"), age_levels)
-
-plot_df_adj <- data.frame(
-  n_taxa    = n_interacting_adj,
-  fev1_adj  = fev1_adjusted,
-  age_group = factor(fev1_age_adj, levels = age_levels))
-
-panel_3a <- ggplot(plot_df_adj, aes(x = n_taxa, y = fev1_adj)) +
-  geom_line(data = boot_lines_adj, aes(x = x, y = y, group = boot),
-            color = "lightblue", alpha = 0.15) +
-  geom_jitter(aes(color = age_group), width = 0.4, alpha = 0.4, size = 1.5) +
-  geom_smooth(method = "lm", color = "#4575B4", se = FALSE, linewidth = 1.1) +
-  scale_color_manual(values = color_vals, name = "Age") +
-  scale_y_continuous() +
-  labs(x = "Number of Interacting Genera",
-       y = expression(Lung~Function~"("*FEV[1]~pp[Adj]*")"),
-       tag = "A") +
-  gg_theme +
-  theme(axis.line = element_blank(),
-        panel.border = element_rect(color = "black", fill = NA, linewidth = 0.25),
-        axis.text.x  = element_text(size = 10, color = "black"),
-        axis.text.y  = element_text(size = 10, color = "black"),
-        axis.title.x = element_text(size = 12, color = "black"),
-        axis.title.y = element_text(size = 12, color = "black"),
-        legend.position = "bottom",
-        legend.text  = element_text(size = 10),
-        legend.title = element_text(size = 10, face = "bold"),
-        plot.tag = element_text(size = 12, face = "bold")) +
-  guides(color = guide_legend(nrow = 2, byrow = TRUE))
-```
-
-### Figure 2B
-
-```{r fig_2B, include=FALSE}
 bx_mat   <- matrix(0, n_genera, n_genera, dimnames = list(genera, genera))
 pval_mat <- matrix(1, n_genera, n_genera, dimnames = list(genera, genera))
 
@@ -1509,7 +1765,7 @@ s       <- seq_len(n_go - 1)
 h_lines <- data.frame(y = s, xmin = 0.5, xmax = (n_go - s) + 1.0)
 v_lines <- data.frame(x = s, ymin = 0.5, ymax = (n_go - s) + 1.0)
 
-panel_3b <- ggplot(bubble_df, aes(x = col_genus, y = row_genus)) +
+panel_2a <- ggplot(bubble_df, aes(x = col_genus, y = row_genus)) +
   geom_segment(data = h_lines, aes(x = xmin, xend = xmax, y = y, yend = y),
                color = "gray80", linewidth = 0.15, inherit.aes = FALSE) +
   geom_segment(data = v_lines, aes(x = x, xend = x, y = ymin, yend = ymax),
@@ -1525,7 +1781,7 @@ panel_3b <- ggplot(bubble_df, aes(x = col_genus, y = row_genus)) +
                    labels = axis_labels, drop = FALSE) +
   scale_y_discrete(limits = rev(genus_order[-1]),
                    labels = axis_labels[rev(genus_order[-1])], drop = FALSE) +
-  labs(x = NULL, y = NULL, tag = "B") +
+  labs(x = NULL, y = NULL, tag = "A") +
   gg_theme +
   theme(axis.line = element_blank(),
         panel.border = element_rect(color = "black", fill = NA, linewidth = 0.25),
@@ -1542,9 +1798,9 @@ panel_3b <- ggplot(bubble_df, aes(x = col_genus, y = row_genus)) +
   guides(size = guide_legend(nrow = 2, byrow = TRUE))
 ```
 
-### Figure 2B inset
+### Figure 2A inset
 
-```{r fig_2B_upset_inset, include=FALSE}
+```{r fig_2A_upset_inset, include=FALSE}
 sig_pairs_upset <- pairwise_results %>%
   filter(significant) %>%
   mutate(
@@ -1571,7 +1827,7 @@ inset_overrides_2b <- theme(
   plot.margin     = margin(2, 3, 2, 2)
 )
 
-upset_inset_2b <- upset(
+upset_inset_2a <- upset(
   data         = as.data.frame(sig_pairs_upset),
   intersect    = c("Oropharyngeal", "Pathogen"),
   name         = NULL,
@@ -1636,8 +1892,229 @@ upset_inset_2b <- upset(
 )
 
 dir.create("figures", showWarnings = FALSE)
-ggsave("figures/figure_2B_upset_inset.pdf", upset_inset_2b,
+ggsave("figures/figure_2A_upset_inset.pdf", upset_inset_2a,
        width = 2.2, height = 1.95, device = cairo_pdf)
+```
+
+### Figure 2B
+
+```{r fig_2B, include=FALSE}
+age_levels  <- age_label_map[age_levels_raw]
+color_vals <- setNames(unname(age_base_cols[age_levels_raw]), age_levels)
+
+plot_df_adj <- data.frame(
+  n_taxa    = n_interacting_adj,
+  fev1_adj  = fev1_adjusted,
+  age_group = factor(fev1_age_adj, levels = age_levels))
+
+panel_2b <- ggplot(plot_df_adj, aes(x = n_taxa, y = fev1_adj)) +
+  geom_line(data = boot_lines_adj, aes(x = x, y = y, group = boot),
+            color = "lightblue", alpha = 0.15) +
+  geom_jitter(aes(color = age_group), width = 0.4, alpha = 0.4, size = 1.5) +
+  geom_smooth(method = "lm", color = "#4575B4", se = FALSE, linewidth = 1.1) +
+  scale_color_manual(values = color_vals, name = "Age") +
+  scale_y_continuous(breaks = seq(25, 125, 25)) +
+  coord_cartesian(ylim = c(12, 141)) +
+  labs(x = "Pairs of Covarying Genera",
+       y = expression(Lung~Function~"("*FEV[1]~pp[Adj]*")"),
+       tag = "B") +
+  gg_theme +
+  theme(axis.line = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, linewidth = 0.25),
+        axis.text.x  = element_text(size = 10, color = "black"),
+        axis.text.y  = element_text(size = 10, color = "black"),
+        axis.title.x = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        legend.position = "bottom",
+        legend.text  = element_text(size = 10),
+        legend.title = element_text(size = 10, face = "bold"),
+        plot.tag = element_text(size = 12, face = "bold")) +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE))
+```
+
+### Figure 2C
+
+```{r fig_2C, include=FALSE}
+C2_DEPTH  <- 1000    
+C2_DRAWS  <- 2000   
+C2_BREAKS <- c(1, 10, 20, 35, 50, 75)
+C2_LABS   <- c(">0-1", "1-10", "10-20", "20-35", "35-50", "50-75", ">75")
+C2_POS    <- c(0.5, 5.5, 15, 27.5, 42.5, 62.5, 87.5)   # bin midpoints, linear scale
+
+c2_oro   <- setdiff(colnames(genus_matrix_filt), cf_pathogens)
+c2_ra    <- 100 * genus_matrix_filt / rowSums(genus_matrix_filt)
+c2_pRA   <- rowSums(c2_ra[, cf_pathogens, drop = FALSE])
+c2_pRds  <- rowSums(genus_matrix_filt[, cf_pathogens, drop = FALSE])
+c2_pRA_all <- c2_pRA           # kept for the lung-function series, which is not
+c2_pRds_all <- c2_pRds         # depth-filtered
+c2_keep  <- rowSums(genus_matrix_filt[, c2_oro, drop = FALSE]) >= C2_DEPTH
+c2_O     <- genus_matrix_filt[c2_keep, c2_oro, drop = FALSE]
+c2_P     <- c2_O / rowSums(c2_O)
+c2_pRA   <- c2_pRA[c2_keep]; c2_pRds <- c2_pRds[c2_keep]
+
+c2_bin <- ifelse(c2_pRds == 0, "0",
+           as.character(cut(c2_pRA, c(-Inf, C2_BREAKS, Inf), labels = C2_LABS)))
+c2_bin <- factor(c2_bin, levels = c("0", C2_LABS))
+c2_idx <- lapply(levels(c2_bin), function(l) which(c2_bin == l))
+
+c2_pairs <- combn(c2_oro, 2); c2_i1 <- c2_pairs[1, ]; c2_i2 <- c2_pairs[2, ]
+c2_bvec  <- function(M) {
+  L <- log10(M + 1); C <- cov(L); C[cbind(c2_i1, c2_i2)] / diag(C)[c2_i2]
+}
+
+c2_rar <- function(Pm, D) {
+  n <- nrow(Pm); K <- ncol(Pm); X <- matrix(0L, n, K)
+  rem <- rep(D, n); remp <- rep(1, n)
+  for (j in seq_len(K - 1)) {
+    q <- pmin(pmax(Pm[, j] / remp, 0), 1); q[!is.finite(q)] <- 0
+    x <- rbinom(n, rem, q); X[, j] <- x; rem <- rem - x; remp <- remp - Pm[, j]
+  }
+  X[, K] <- rem; colnames(X) <- colnames(Pm); X
+}
+
+dir.create("r_objects", showWarnings = FALSE)
+if (file.exists("r_objects/fig2C_boot.rds")) {
+  c2_mb <- readRDS("r_objects/fig2C_boot.rds")
+} else {
+  set.seed(97)
+  c2_mb <- matrix(NA_real_, C2_DRAWS, length(levels(c2_bin)))
+  for (b in seq_len(C2_DRAWS)) for (j in seq_along(c2_idx)) {
+    s <- sample(c2_idx[[j]], length(c2_idx[[j]]), replace = TRUE)
+    c2_mb[b, j] <- mean(c2_bvec(c2_rar(c2_P[s, , drop = FALSE], C2_DEPTH)))
+  }
+  colnames(c2_mb) <- levels(c2_bin)
+  saveRDS(c2_mb, "r_objects/fig2C_boot.rds")
+}
+
+c2_rel <- c2_mb / c2_mb[, 1]
+c2_pl  <- 2:ncol(c2_mb)
+c2_bp  <- function(v) { p1 <- mean(v <= 0); max(2 * min(p1, 1 - p1), 1 / C2_DRAWS) }
+c2_cmb <- combn(length(c2_pl), 2)
+c2_Q   <- p.adjust(vapply(seq_len(ncol(c2_cmb)), function(k)
+  c2_bp(c2_mb[, c2_pl][, c2_cmb[1, k]] - c2_mb[, c2_pl][, c2_cmb[2, k]]),
+  numeric(1)), "BH")
+
+c2_M <- matrix(1, length(c2_pl), length(c2_pl), dimnames = list(C2_LABS, C2_LABS))
+for (k in seq_len(ncol(c2_cmb)))
+  c2_M[c2_cmb[1, k], c2_cmb[2, k]] <- c2_M[c2_cmb[2, k], c2_cmb[1, k]] <- c2_Q[k]
+
+c2_adj <- c2_M > 0.05; diag(c2_adj) <- TRUE
+c2_mn  <- colMeans(c2_mb[, c2_pl]); c2_cl <- list()
+for (sz in length(c2_pl):1) for (cb in asplit(combn(length(c2_pl), sz), 2)) {
+  v <- as.integer(cb)
+  if (all(c2_adj[v, v]) && !any(vapply(c2_cl, function(c0) all(v %in% c0), logical(1))))
+    c2_cl[[length(c2_cl) + 1]] <- v
+}
+c2_cl  <- c2_cl[order(vapply(c2_cl, function(v) -max(c2_mn[v]), numeric(1)))]
+c2_ltr <- setNames(rep("", length(c2_pl)), C2_LABS)
+for (i in seq_along(c2_cl)) for (j in c2_cl[[i]])
+  c2_ltr[C2_LABS[j]] <- paste0(c2_ltr[C2_LABS[j]], letters[i])
+
+fig2c_df <- data.frame(
+  stratum = C2_LABS, pos = C2_POS,
+  n       = as.integer(table(c2_bin))[c2_pl],
+  rel     = colMeans(c2_rel[, c2_pl]),
+  lo      = apply(c2_rel[, c2_pl], 2, quantile, 0.025),
+  hi      = apply(c2_rel[, c2_pl], 2, quantile, 0.975),
+  letter  = c2_ltr[C2_LABS], stringsAsFactors = FALSE)
+
+C2_FEV_CUT <- 80
+c2_meta  <- cf_microbiome_metadata[match(rownames(genus_matrix_filt),
+                                         cf_microbiome_metadata$Run), ]
+c2_fev   <- suppressWarnings(as.numeric(c2_meta$FEV1))
+c2_binF  <- ifelse(c2_pRds_all == 0, "0",
+             as.character(cut(c2_pRA_all, c(-Inf, C2_BREAKS, Inf), labels = C2_LABS)))
+c2_binF  <- factor(c2_binF, levels = c("0", C2_LABS))
+c2_hi    <- !is.na(c2_fev) & c2_fev >= C2_FEV_CUT
+c2_okF   <- !is.na(c2_fev) & c2_binF != "0"
+c2_idxF  <- lapply(C2_LABS, function(l) which(c2_binF == l & c2_okF))
+
+if (file.exists("r_objects/fig2C_lf_boot.rds")) {
+  c2_fb <- readRDS("r_objects/fig2C_lf_boot.rds")
+} else {
+  set.seed(11)
+  c2_fb <- matrix(NA_real_, C2_DRAWS, length(C2_LABS))
+  for (b in seq_len(C2_DRAWS)) for (j in seq_along(c2_idxF))
+    c2_fb[b, j] <- 100 * mean(c2_hi[sample(c2_idxF[[j]],
+                                           length(c2_idxF[[j]]), replace = TRUE)])
+  saveRDS(c2_fb, "r_objects/fig2C_lf_boot.rds")
+}
+colnames(c2_fb) <- C2_LABS
+
+c2_QF <- p.adjust(vapply(seq_len(ncol(c2_cmb)), function(k)
+  c2_bp(c2_fb[, c2_cmb[1, k]] - c2_fb[, c2_cmb[2, k]]), numeric(1)), "BH")
+c2_MF <- matrix(1, length(C2_LABS), length(C2_LABS),
+                dimnames = list(C2_LABS, C2_LABS))
+for (k in seq_len(ncol(c2_cmb)))
+  c2_MF[c2_cmb[1, k], c2_cmb[2, k]] <- c2_MF[c2_cmb[2, k], c2_cmb[1, k]] <- c2_QF[k]
+c2_adjF <- c2_MF > 0.05; diag(c2_adjF) <- TRUE
+c2_mnF  <- colMeans(c2_fb); c2_clF <- list()
+for (sz in length(C2_LABS):1) for (cb in asplit(combn(length(C2_LABS), sz), 2)) {
+  v <- as.integer(cb)
+  if (all(c2_adjF[v, v]) && !any(vapply(c2_clF, function(c0) all(v %in% c0), logical(1))))
+    c2_clF[[length(c2_clF) + 1]] <- v
+}
+c2_clF  <- c2_clF[order(vapply(c2_clF, function(v) -max(c2_mnF[v]), numeric(1)))]
+c2_ltrF <- setNames(rep("", length(C2_LABS)), C2_LABS)
+for (i in seq_along(c2_clF)) for (j in c2_clF[[i]])
+  c2_ltrF[C2_LABS[j]] <- paste0(c2_ltrF[C2_LABS[j]], letters[i])
+
+fig2c_lf <- data.frame(stratum = C2_LABS, pos = C2_POS,
+  n = lengths(c2_idxF), pct = c2_mnF,
+  lo = apply(c2_fb, 2, quantile, 0.025),
+  hi = apply(c2_fb, 2, quantile, 0.975),
+  letter = c2_ltrF[C2_LABS], stringsAsFactors = FALSE)
+
+c2_track <- vapply(seq_len(C2_DRAWS), function(b)
+  cor(c2_rel[b, c2_pl], c2_fb[b, ], method = "spearman"), numeric(1))
+c2_track_p <- max(2 * min(mean(c2_track <= 0), mean(c2_track >= 0)), 1 / C2_DRAWS)
+
+C2_Y  <- c(0.12, 1.41); C2_F <- c(0, 85)
+c2_f2y <- function(v) C2_Y[1] + (v - C2_F[1]) * diff(C2_Y) / diff(C2_F)
+C2_OFF <- 1.6      
+c2_a <- transform(fig2c_df, x = pos - C2_OFF)
+c2_b <- transform(fig2c_lf,
+  x = pos + C2_OFF, y = c2_f2y(pct), ylo = c2_f2y(lo), yhi = c2_f2y(hi))
+
+panel_2c <- ggplot() +
+  geom_errorbar(data = c2_a, aes(x, ymin = lo, ymax = hi), width = 1.8,
+                linewidth = 0.55, color = "black") +
+  geom_point(data = c2_a, aes(x, rel), size = 3.0, color = "black") +
+  geom_text(data = c2_a, aes(x, hi + 0.05, label = letter),
+            size = 3.5, color = "black") +
+  geom_errorbar(data = c2_b, aes(x, ymin = ylo, ymax = yhi), width = 1.8,
+                linewidth = 0.55, color = "#4575B4") +
+  geom_point(data = c2_b, aes(x, y), size = 3.0, color = "#4575B4") +
+  geom_text(data = c2_b, aes(x, yhi + 0.05, label = letter),
+            size = 3.5, color = "#4575B4") +
+  scale_x_continuous("Pathogen Relative Abundance (%)",
+                     breaks = C2_POS, labels = C2_LABS) +
+  scale_y_continuous("Relative Mean Oropharyngeal Covariation",
+    breaks = seq(0.25, 1.25, 0.25),
+    labels = sprintf("%.2f", seq(0.25, 1.25, 0.25)),
+    sec.axis = sec_axis(~ C2_F[1] + (. - C2_Y[1]) * diff(C2_F) / diff(C2_Y),
+      name = expression("High Lung Function ("*FEV[1]~pp>=80*", %)"),
+      breaks = seq(0, 80, 20))) +
+  coord_cartesian(xlim = c(-1.5, 90), ylim = C2_Y) +
+  labs(tag = "C") +
+  gg_theme +
+  theme(axis.line    = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, linewidth = 0.25),
+        axis.text.x  = element_text(size = 10, color = "black", angle = 45, hjust = 1),
+        axis.title.x      = element_text(size = 12, color = "black"),
+        axis.text.y.left  = element_text(size = 10, color = "black"),
+        axis.title.y.left = element_text(size = 12, color = "black"),
+        axis.text.y.right = element_text(size = 10, color = "#4575B4"),
+        axis.title.y.right= element_text(size = 11, color = "#4575B4"),
+        plot.tag     = element_text(size = 12, face = "bold"))
+
+sprintf("Figure 2C: covariation reference n = %d, lung function n = %d",
+        length(c2_idx[[1]]), sum(lengths(c2_idxF)))
+sprintf("series track: Spearman = %.2f (95%% CI %.2f to %.2f), P = %.4f",
+        cor(fig2c_df$rel, fig2c_lf$pct, method = "spearman"),
+        quantile(c2_track, 0.025), quantile(c2_track, 0.975), c2_track_p)
+print(fig2c_df, row.names = FALSE, digits = 3)
+print(fig2c_lf, row.names = FALSE, digits = 3)
 ```
 
 ### Figure 2
@@ -1645,18 +2122,13 @@ ggsave("figures/figure_2B_upset_inset.pdf", upset_inset_2b,
 ```{r fig_2, include=FALSE}
 fig2_panel_size <- grid::unit(3.2, "in")
 
-leg_3a         <- cowplot::get_legend(panel_3a)
-leg_3b         <- cowplot::get_legend(panel_3b)
-panel_3a_noleg <- egg::set_panel_size(panel_3a +
-                                        theme(legend.position = "none",
-                                              aspect.ratio = NULL),
-                                      width = fig2_panel_size,
-                                      height = fig2_panel_size)
-panel_3b_noleg <- egg::set_panel_size(panel_3b +
-                                        theme(legend.position = "none",
-                                              aspect.ratio = NULL),
-                                      width = fig2_panel_size,
-                                      height = fig2_panel_size)
+leg_2b <- cowplot::get_legend(panel_2b)
+leg_2a <- cowplot::get_legend(panel_2a)
+strip  <- function(p) egg::set_panel_size(
+  p + theme(legend.position = "none", aspect.ratio = NULL),
+  width = fig2_panel_size, height = fig2_panel_size)
+fig2_panels <- lapply(list(panel_2a, panel_2b, panel_2c), strip)
+
 pad_to_height <- function(g, target_h_in) {
   cur_h <- sum(grid::convertHeight(g$heights, "in", valueOnly = TRUE))
   if (cur_h < target_h_in) {
@@ -1664,24 +2136,21 @@ pad_to_height <- function(g, target_h_in) {
   }
   g
 }
-fig2_heights <- c(
-  sum(grid::convertHeight(panel_3a_noleg$heights, "in", valueOnly = TRUE)),
-  sum(grid::convertHeight(panel_3b_noleg$heights, "in", valueOnly = TRUE))
-)
-fig2_hmax      <- max(fig2_heights)
-panel_3a_noleg <- pad_to_height(panel_3a_noleg, fig2_hmax)
-panel_3b_noleg <- pad_to_height(panel_3b_noleg, fig2_hmax)
+fig2_hmax   <- max(vapply(fig2_panels, function(g)
+  sum(grid::convertHeight(g$heights, "in", valueOnly = TRUE)), numeric(1)))
+fig2_panels <- lapply(fig2_panels, pad_to_height, target_h_in = fig2_hmax)
 
-top_row  <- cowplot::plot_grid(panel_3a_noleg, panel_3b_noleg, ncol = 2)
-leg_row  <- cowplot::plot_grid(leg_3a, leg_3b, ncol = 2)
+top_row  <- cowplot::plot_grid(plotlist = fig2_panels, ncol = 3)
+leg_row  <- cowplot::plot_grid(leg_2a, leg_2b, NULL, ncol = 3)
 figure_2 <- cowplot::plot_grid(top_row, leg_row, ncol = 1, rel_heights = c(1, 0.2))
-ggsave("figures/figure_2.pdf", figure_2, width = 10, height = 7, device = cairo_pdf)
+ggsave("figures/figure_2.pdf", figure_2, width = 15, height = 7,
+       device = cairo_pdf)
 ```
 
 ### Figure 3B
 
 ```{r fig_3B_donut, include=FALSE}
-figure_4b <- ggplot(inhibition_counts, aes(ymax = ymax, ymin = ymin,
+panel_3b <- ggplot(inhibition_counts, aes(ymax = ymax, ymin = ymin,
                                             xmax = 4, xmin = 3,
                                             fill = inhibition)) +
   geom_rect() +
@@ -1799,7 +2268,7 @@ leg_3 <- cowplot::get_legend(leg_3_dummy)
 top_row_3 <- cowplot::plot_grid(
   panel_3a_placeholder + labs(tag = "A") +
     theme(plot.tag = element_text(size = 12, face = "bold")),
-  figure_4b + labs(tag = "B") +
+  panel_3b + labs(tag = "B") +
     theme(plot.tag = element_text(size = 12, face = "bold")),
   ncol = 2
 )
@@ -1821,9 +2290,101 @@ ggsave("figures/figure_3.pdf", figure_3, units = "in",
        width = 8, height = 9, device = cairo_pdf)
 ```
 
-### Figure 4A
+### Figure 4
 
-```{r fig_4A, include=FALSE}
+```{r fig_4_xstreak, include=FALSE}
+SY_MIN_ASSAYS <- 10
+
+sy_genera <- unique(c(pairwise_results$genus1, pairwise_results$genus2))
+
+sy_assays <- bioassay_data %>%
+  left_join(cf_isolates %>% dplyr::select(isolate, genus), by = "isolate") %>%
+  dplyr::rename(producer = genus) %>%
+  mutate(target_genus = sub(" .*$", "", target)) %>%
+  filter(!is.na(producer), producer %in% sy_genera,
+         target_genus %in% sy_genera, producer != target_genus)
+
+sy_dir <- sy_assays %>%
+  group_by(producer, target_genus) %>%
+  summarize(assays = n(), pct_inh = 100 * mean(inhibition >= 1), .groups = "drop") %>%
+  filter(assays >= SY_MIN_ASSAYS)
+
+sy_key <- function(a, b) paste(pmin(a, b), pmax(a, b), sep = "|")
+sy_pairs <- sy_dir %>%
+  mutate(pair = sy_key(producer, target_genus)) %>%
+  group_by(pair) %>%
+  slice_max(pct_inh, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(bx = pairwise_results$bx[match(pair,
+           sy_key(pairwise_results$genus1, pairwise_results$genus2))]) %>%
+  filter(!is.na(bx))
+
+SY_BAR <- "⟞"
+sy_lv  <- c(paste("Pathogen",      SY_BAR, "Pathogen"),
+            paste("Pathogen",      SY_BAR, "Oropharyngeal"),
+            paste("Oropharyngeal", SY_BAR, "Pathogen"),
+            paste("Oropharyngeal", SY_BAR, "Oropharyngeal"))
+sy_pp <- sy_pairs$producer     %in% cf_pathogens
+sy_tp <- sy_pairs$target_genus %in% cf_pathogens
+sy_pairs$pair_type <- factor(
+  ifelse(sy_pp &  sy_tp, sy_lv[1],
+  ifelse(sy_pp & !sy_tp, sy_lv[2],
+  ifelse(!sy_pp & sy_tp, sy_lv[3], sy_lv[4]))), levels = sy_lv)
+
+sy_ct  <- suppressWarnings(
+  cor.test(sy_pairs$pct_inh, sy_pairs$bx, method = "spearman"))
+sy_lab <- paste0("italic(r)[s]== ", sprintf("%.2f", sy_ct$estimate),
+                 "~~italic(P)== ", sprintf("%.3f", sy_ct$p.value))
+
+sy_cols <- setNames(c("#E69F00", "#4575B4", "#56B4E9", "gray55"), sy_lv)
+
+figure_4 <- ggplot(sy_pairs, aes(pct_inh, bx)) +
+  geom_hline(yintercept = 0, linetype = "dashed",
+             color = "gray45", linewidth = 0.45) +
+  geom_smooth(method = "lm", formula = y ~ x, color = "#D73027",
+              fill = "#D73027", alpha = 0.16, linewidth = 1.0) +
+  geom_point(aes(color = pair_type, size = assays), alpha = 0.9) +
+  scale_color_manual(values = sy_cols) +
+  scale_size_continuous(range = c(1.8, 6), breaks = c(20, 100, 500, 1200)) +
+  scale_x_continuous("Target Inhibition in Cross-Streak Assays (%)",
+                     breaks = seq(0, 80, 20)) +
+  scale_y_continuous(expression("Covariation Coefficient ("*italic(b)*")"),
+                     breaks = seq(-0.1, 0.5, 0.1),
+                     labels = sprintf("%.1f", seq(-0.1, 0.5, 0.1))) +
+  coord_cartesian(xlim = c(-6, 92), ylim = c(-0.18, 0.60)) +
+  theme_classic(base_size = 11) +
+  theme(aspect.ratio  = 1,
+        axis.line     = element_blank(),
+        panel.border  = element_rect(color = "black", fill = NA, linewidth = 0.35),
+        axis.text     = element_text(size = 9.5, color = "black"),
+        axis.title    = element_text(size = 11, color = "black"),
+        axis.ticks    = element_line(color = "black", linewidth = 0.3),
+        legend.position   = "bottom",
+        legend.title      = element_text(size = 9.2),
+        legend.text       = element_text(size = 9.2, family = "Segoe UI Symbol"),
+        legend.key        = element_blank(),
+        legend.background = element_blank(),
+        legend.key.height = unit(0.32, "cm"),
+        legend.box        = "vertical",
+        legend.spacing.y  = unit(0.5, "cm"),
+        legend.margin     = margin(t = 0, b = 0)) +
+  guides(color = guide_legend(title = NULL, nrow = 2, order = 1,
+                              override.aes = list(size = 2.8)),
+         size  = guide_legend(title = "Number of Assays", nrow = 1, order = 2,
+                              title.position = "left", title.vjust = 0.5))
+
+dir.create("figures", showWarnings = FALSE)
+ggsave("figures/figure_4.pdf", figure_4, width = 5.8, height = 6.5,
+       device = cairo_pdf)
+
+sprintf("Figure 4: %d genus pairs, Spearman rho = %.3f, P = %.4f",
+        nrow(sy_pairs), sy_ct$estimate, sy_ct$p.value)
+print(as.data.frame(table(sy_pairs$pair_type)))
+```
+
+### Figure 5A
+
+```{r fig_5A, include=FALSE}
 fig5_lead   <- c("*Pseudomonas*", "*Stenotrophomonas*", "*Escherichia*", "*Staphylococcus*")
 fig5_others <- setdiff(unique(as.character(isolate_inhibition$genus)), fig5_lead)
 fig5_order  <- c(fig5_lead, fig5_others)
@@ -1890,9 +2451,9 @@ leg_5a <- cowplot::get_legend(
 )
 ```
 
-### Figure 4B
+### Figure 5B
 
-```{r fig_4B, include=FALSE}
+```{r fig_5B, include=FALSE}
 total_inhibition_per_isolate <- total_inhibition_per_isolate %>%
   mutate(genus = factor(as.character(genus), levels = fig5_order))
 
@@ -1996,9 +2557,9 @@ z_score_per_isolate_plot <- ggplot(data = total_inhibition_per_isolate,
 #ggsave("./figures/z_score_per_isolate_plot.pdf", z_score_per_isolate_plot, units = "in", height = 4, width = 6.47)
 ```
 
-### Figure 4
+### Figure 5
 
-```{r fig_4, include=FALSE}
+```{r fig_5, include=FALSE}
 aligned_5 <- cowplot::align_plots(isolate_inhibition_figure,
                                    z_score_per_isolate_plot,
                                    align = "v", axis = "lr")
@@ -2010,14 +2571,13 @@ combined_inhibition_figure <- ggdraw(
   draw_label("A", x = 0.01, y = 0.99, hjust = 0, vjust = 1, fontface = "bold", size = 14) +
   draw_label("B", x = 0.01, y = 0.475, hjust = 0, vjust = 1, fontface = "bold", size = 14)
 
-ggsave("./figures/figure_4.pdf", combined_inhibition_figure, units = "in",
+ggsave("./figures/figure_5.pdf", combined_inhibition_figure, units = "in",
        height = 8.5, width = 6.47)
 ```
 
+### Figure 7
 
-### Figure 6
-
-```{r fig_6, include=FALSE}
+```{r fig_7, include=FALSE}
 lcms_mcol <- grep("\\.mean$", colnames(lcms_diff), value = TRUE)
 lcms_M    <- as.matrix(lcms_diff[, lcms_mcol])
 lcms_gmax <- apply(lcms_M, 1, max)
@@ -2042,7 +2602,7 @@ lcms_ticdf <- bind_rows(lapply(lcms_keep, function(i) {
              tic = pmax(m[, 2] - lcms_bfun(m[, 1]), 0)) }))
 lcms_ticdf$mz <- lcms_ticdf$tic / max(lcms_ticdf$tic) * lcms_mztop * 0.95
 
-panel_6A <- ggplot() +
+panel_7A <- ggplot() +
   geom_line(data = lcms_ticdf, aes(rt_min, mz, group = sample, color = inhibition),
             linewidth = 0.15, alpha = 0.5) +
   geom_point(data = lcms_feat, aes(rt_min, mz, size = log2fc),
@@ -2074,17 +2634,17 @@ dir.create("r_objects", showWarnings = FALSE)
 if (file.exists("r_objects/lcms_pvclust.rds")) {
   lcms_pv <- readRDS("r_objects/lcms_pvclust.rds")
 } else {
+  set.seed(8675309)   
   lcms_pv <- pvclust(lcms_matz, method.dist = "euclidean", method.hclust = "complete",
                      nboot = lcms_n_boot, quiet = TRUE)
   saveRDS(lcms_pv, "r_objects/lcms_pvclust.rds")
 }
 
-lcms_tmp <- tempfile(fileext = ".png")
-png(lcms_tmp, width = lcms_plots_w, height = 3, units = "in", res = 100)
-lcms_gA <- ggplotGrob(panel_6A + theme(legend.position = "none"))
+pdf(NULL, width = lcms_plots_w, height = 3)
+lcms_gA <- ggplotGrob(panel_7A + theme(legend.position = "none"))
 lcms_pl <- subset(lcms_gA$layout, name == "panel")
 lcms_left_mm <- convertWidth(sum(lcms_gA$widths[seq_len(min(lcms_pl$l) - 1)]), "mm", valueOnly = TRUE)
-invisible(dev.off()); unlink(lcms_tmp)
+invisible(dev.off())
 
 lcms_topann <- HeatmapAnnotation(
   HID = lcms_iso_meta$host, Inhibition = lcms_iso_meta$inhibition,
@@ -2098,7 +2658,7 @@ lcms_ht <- Heatmap(
   column_names_gp = gpar(fontsize = 10), column_names_rot = 45, col = lcms_val_col,
   use_raster = TRUE, raster_quality = 3,
   heatmap_legend_param = list(direction = "horizontal"), border = TRUE)
-panel_6B <- grid.grabExpr({
+panel_7B <- grid.grabExpr({
   draw(lcms_ht, heatmap_legend_side = "bottom", show_annotation_legend = FALSE,
        padding = unit(c(2, lcms_left_mm, 2, 19), "mm"))
   decorate_column_dend("Feature Z-Score", {
@@ -2112,7 +2672,7 @@ panel_6B <- grid.grabExpr({
     grid.text("Inhibition", x = unit(1, "npc") + unit(1, "mm"), just = "left", gp = gpar(fontsize = 10, fontface = "bold")))
 }, width = lcms_plots_w, height = lcms_fig_h * lcms_rel_h[2] / sum(lcms_rel_h))
 
-lcms_legA <- get_legend(panel_6A + guides(color = "none") +
+lcms_legA <- get_legend(panel_7A + guides(color = "none") +
   theme(legend.position = "right", legend.box = "vertical",
         legend.title = element_text(size = 10), legend.text = element_text(size = 9)))
 lcms_legB <- packLegend(
@@ -2125,22 +2685,20 @@ lcms_legB <- packLegend(
   gap = unit(5, "mm"))
 lcms_legB_grob <- grid.grabExpr(draw(lcms_legB))
 
-lcms_plots_col <- plot_grid(panel_6A + theme(legend.position = "none",
-                              plot.margin = margin(5.5, 53.9, 5.5, 5.5, "pt")), panel_6B,
+lcms_plots_col <- plot_grid(panel_7A + theme(legend.position = "none",
+                              plot.margin = margin(5.5, 53.9, 5.5, 5.5, "pt")), panel_7B,
                             ncol = 1, labels = c("A", "B"), label_size = 12,
                             label_fontface = "bold", rel_heights = lcms_rel_h)
 lcms_legs_col  <- plot_grid(lcms_legA, lcms_legB_grob, ncol = 1, rel_heights = lcms_rel_h)
-figure_6       <- plot_grid(lcms_plots_col, lcms_legs_col, ncol = 2, rel_widths = lcms_rel_w)
+figure_7       <- plot_grid(lcms_plots_col, lcms_legs_col, ncol = 2, rel_widths = lcms_rel_w)
 
 dir.create("figures", showWarnings = FALSE)
-ggsave("figures/figure_6.pdf", figure_6, width = lcms_fig_w, height = lcms_fig_h, device = cairo_pdf)
+ggsave("figures/figure_7.pdf", figure_7, width = lcms_fig_w, height = lcms_fig_h, device = cairo_pdf)
 ```
 
-## Pseudomonas genome comparison
+### Figure 8
 
-### Figure 7
-
-```{r fig_7, include=FALSE}
+```{r fig_8, include=FALSE}
 local({
   PD  <- file.path("derivedData", "genome_comparison", "plotdata")
   FIG <- "figures"
@@ -2223,8 +2781,6 @@ local({
       text(aL$x, aL$y, bgc$num[i], cex = 1.15, col = "#2C2C2A")
     }
 
-    # variant ticks (only variants in the non-inhibitory genome), colored by
-    # mutation class; * marks BGC-associated variants
     for (i in seq_len(nrow(mut))) {
       f <- tf(mut$f[i], o, off)
       p1 <- xy(R_MUT_IN, f); p2 <- xy(R_MUT_OUT, f)
@@ -2285,19 +2841,16 @@ local({
     dev.off()
   }
 
-  tryCatch(render(function() cairo_pdf(file.path(FIG, "figure_7.pdf"), width = 15, height = 8.7,
-                                       pointsize = 12), "pdf"),
-           error = function(e) message("Figure 7 PDF skipped (locked?): ", conditionMessage(e)))
+  render(function() cairo_pdf(file.path(FIG, "figure_8.pdf"), width = 15, height = 8.7,
+                              pointsize = 12), "pdf")
 })
 ```
 
-### Tables S4 and S5
+### Tables S6 and S7
 
-
-```{r tables_S4_S5, include=FALSE}
+```{r tables_S6_S7, include=FALSE}
 lcms_gc_tab <- file.path("derivedData", "genome_comparison", "tables")
 dir.create("tables", showWarnings = FALSE)
-
 
 build_variant_table <- function(donor, outfile) {
   v <- read.delim(file.path(lcms_gc_tab, paste0(donor, "_differences.tsv")),
@@ -2314,8 +2867,8 @@ build_variant_table <- function(donor, outfile) {
   write.csv(v, outfile, row.names = FALSE)
   v
 }
-table_S4 <- build_variant_table("HID07", file.path("tables", "Table_S4.csv"))  # HID07
-table_S5 <- build_variant_table("HID08", file.path("tables", "Table_S5.csv"))  # HID08
+table_S6 <- build_variant_table("HID07", file.path("tables", "Table_S6.csv"))  # HID07
+table_S7 <- build_variant_table("HID08", file.path("tables", "Table_S7.csv"))  # HID08
 ```
 
 ### Figure S1A
@@ -2368,7 +2921,7 @@ pathogen_axis_labels <- setNames(
   pathogen_in_table
 )
 
-panel_1b_outliers <- pathogen_dominant_obs %>%
+panel_S1a_outliers <- pathogen_dominant_obs %>%
   group_by(taxon) %>%
   mutate(.q1 = quantile(ra, 0.25, na.rm = TRUE),
          .q3 = quantile(ra, 0.75, na.rm = TRUE),
@@ -2376,9 +2929,9 @@ panel_1b_outliers <- pathogen_dominant_obs %>%
   filter(ra < .q1 - 1.5 * .iqr | ra > .q3 + 1.5 * .iqr) %>%
   ungroup()
 
-panel_1b <- ggplot(pathogen_dominant_obs, aes(x = taxon, y = ra, fill = taxon)) +
+panel_S1a <- ggplot(pathogen_dominant_obs, aes(x = taxon, y = ra, fill = taxon)) +
   geom_boxplot(alpha = 0.7, width = 0.5, notch = TRUE, outlier.shape = NA) +
-  geom_point(data = panel_1b_outliers, aes(fill = taxon),
+  geom_point(data = panel_S1a_outliers, aes(fill = taxon),
              shape = 21, color = "black", stroke = 0.2,
              size = 1, alpha = 0.85) +
   geom_text(data = pathogen_letter_pos,
@@ -2418,7 +2971,7 @@ q2_p_label <- if (q2_p_value < 2.2e-16) {
   sprintf("italic(P) == '%.1g'", q2_p_value)
 }
 
-panel_1c_outliers <- dominant_obs_grouped %>%
+panel_S1b_outliers <- dominant_obs_grouped %>%
   group_by(group) %>%
   mutate(.q1 = quantile(ra, 0.25, na.rm = TRUE),
          .q3 = quantile(ra, 0.75, na.rm = TRUE),
@@ -2426,9 +2979,9 @@ panel_1c_outliers <- dominant_obs_grouped %>%
   filter(ra < .q1 - 1.5 * .iqr | ra > .q3 + 1.5 * .iqr) %>%
   ungroup()
 
-panel_1c <- ggplot(dominant_obs_grouped, aes(x = group, y = ra, fill = group)) +
+panel_S1b <- ggplot(dominant_obs_grouped, aes(x = group, y = ra, fill = group)) +
   geom_boxplot(alpha = 0.7, width = 0.5, notch = TRUE, outlier.shape = NA) +
-  geom_point(data = panel_1c_outliers, aes(fill = group),
+  geom_point(data = panel_S1b_outliers, aes(fill = group),
              shape = 21, color = "black", stroke = 0.2,
              size = 1, alpha = 0.85) +
   scale_fill_manual(values = group_cols, guide = "none") +
@@ -2451,7 +3004,7 @@ panel_1c <- ggplot(dominant_obs_grouped, aes(x = group, y = ra, fill = group)) +
 ### Figure S1
 
 ```{r fig_S1, include=FALSE}
-figure_S1 <- panel_1b + panel_1c +
+figure_S1 <- panel_S1a + panel_S1b +
   patchwork::plot_layout(widths = c(1.6, 1)) +
   patchwork::plot_annotation(
     tag_levels = list(c("A", "B")),
@@ -2525,7 +3078,7 @@ s1a_df <- nmds_scores %>%
   mutate(Age_bin = factor(Age_bin, levels = age_levels_s1))
 age_labels_s1  <- legend_with_n(s1a_df$Age_bin, age_range_s1)
 
-panel_s1a <- ggplot(s1a_df, aes(MDS1, MDS2, color = Age_bin)) +
+panel_S2a <- ggplot(s1a_df, aes(MDS1, MDS2, color = Age_bin)) +
   geom_point(size = 0.5, alpha = 0.5) +
   stat_ellipse(type = "norm", level = 0.95, linewidth = 0.4) +
   scale_color_manual(values = age_cols_s1, labels = age_labels_s1,
@@ -2543,7 +3096,7 @@ s1b_df <- nmds_scores %>%
   mutate(FEV1_bin = factor(FEV1_bin, levels = fev1_levels_s1))
 fev1_labels_s1 <- legend_with_n(s1b_df$FEV1_bin, fev1_range_s1)
 
-panel_s1b <- ggplot(s1b_df, aes(MDS1, MDS2, color = FEV1_bin)) +
+panel_S2b <- ggplot(s1b_df, aes(MDS1, MDS2, color = FEV1_bin)) +
   geom_point(size = 0.5, alpha = 0.5) +
   stat_ellipse(type = "norm", level = 0.95, linewidth = 0.4) +
   scale_color_manual(values = fev1_cols_s1, labels = fev1_labels_s1,
@@ -2562,7 +3115,7 @@ sex_labels_s1 <- setNames(
   names(table(s1c_df$Sex))
 )
 
-panel_s1c <- ggplot(s1c_df, aes(MDS1, MDS2, color = Sex)) +
+panel_S2c <- ggplot(s1c_df, aes(MDS1, MDS2, color = Sex)) +
   geom_point(size = 0.5, alpha = 0.5) +
   stat_ellipse(type = "norm", level = 0.95, linewidth = 0.4) +
   scale_color_brewer(palette = "Set1", labels = sex_labels_s1, name = "Sex") +
@@ -2573,14 +3126,298 @@ panel_s1c <- ggplot(s1c_df, aes(MDS1, MDS2, color = Sex)) +
   theme(aspect.ratio = 1) +
   guides(color = guide_legend(nrow = 1, override.aes = list(size = 2, alpha = 1)))
 
-figure_s1 <- panel_s1a | panel_s1b | panel_s1c
+figure_S2 <- panel_S2a | panel_S2b | panel_S2c
 
-ggsave("figures/figure_S2.pdf", figure_s1, width = 9, height = 6, device = cairo_pdf)
+ggsave("figures/figure_S2.pdf", figure_S2, width = 9, height = 6, device = cairo_pdf)
 ```
 
 ### Figure S3
 
-```{r fig_S3, include=FALSE}
+```{r fig_S3_genus_age, include=FALSE}
+GENUS_THRESH <- 1     
+
+ga_build <- function(require_fev1) {
+  M <- genus_matrix_filt
+  M <- M[rowSums(M) > 0, , drop = FALSE]
+  mt <- cf_microbiome_metadata[match(rownames(M), cf_microbiome_metadata$Run), ]
+  mt$FEV1 <- suppressWarnings(as.numeric(mt$FEV1))
+  mt$Age  <- suppressWarnings(as.numeric(mt$Age))
+  ok <- !is.na(mt$Age) & !is.na(mt$Sample_Type) & mt$Sample_Type != ""
+  if (require_fev1) ok <- ok & !is.na(mt$FEV1)
+  M <- M[ok, , drop = FALSE]; mt <- mt[ok, ]
+  ind <- run_indiv[rownames(M)]
+  keep <- !is.na(ind)
+  M <- M[keep, , drop = FALSE]; mt <- mt[keep, ]; ind <- ind[keep]
+  pool <- rowsum(M, group = ind)
+  modal <- function(x) names(sort(table(x), decreasing = TRUE))[1]
+  meta <- data.frame(
+    indiv = rownames(pool),
+    Age   = tapply(mt$Age,         ind, mean)[rownames(pool)],
+    FEV1  = tapply(mt$FEV1,        ind, mean)[rownames(pool)],
+    BP    = tapply(mt$BioProject,  ind, modal)[rownames(pool)],
+    ST    = tapply(mt$Sample_Type, ind, modal)[rownames(pool)],
+    stringsAsFactors = FALSE)
+  list(ra = sweep(pool, 1, rowSums(pool), "/") * 100, meta = meta)
+}
+ga_age <- ga_build(FALSE)
+ga_lf  <- ga_build(TRUE)
+
+ga_age$meta$agr <- factor(ifelse(ga_age$meta$Age >= 18, "18+", "0–17"),
+                          levels = c("0–17", "18+"))
+ga_lf$meta$fev10 <- -ga_lf$meta$FEV1 / 10   # per 10-point DECREASE
+
+ga_fit <- function(obj, term, adj_age) {
+  do.call(rbind, lapply(colnames(obj$ra), function(g) {
+    d <- data.frame(pres = as.integer(obj$ra[, g] >= GENUS_THRESH),
+                    x = obj$meta[[term]], BP = factor(obj$meta$BP),
+                    ST = factor(obj$meta$ST), Age = obj$meta$Age)
+    d <- d[complete.cases(d), ]
+    f <- if (adj_age) pres ~ x + Age + BP + ST else pres ~ x + BP + ST
+    s <- tryCatch(summary(glm(f, data = d, family = binomial))$coefficients,
+                  error = function(e) NULL)
+    rn <- if (is.null(s)) NA else grep("^x", rownames(s), value = TRUE)[1]
+    if (is.null(s) || is.na(rn)) return(NULL)
+    data.frame(genus = g, OR = exp(s[rn, 1]),
+               lo = exp(s[rn, 1] - 1.96 * s[rn, 2]),
+               hi = exp(s[rn, 1] + 1.96 * s[rn, 2]),
+               p = s[rn, 4], stringsAsFactors = FALSE)
+  }))
+}
+ga_A <- ga_fit(ga_age, "agr",   FALSE)   
+ga_B <- ga_fit(ga_lf,  "fev10", TRUE)    
+ga_A$q <- p.adjust(ga_A$p, "BH")
+ga_B$q <- p.adjust(ga_B$p, "BH")
+
+dir.create("tables", showWarnings = FALSE)
+
+ga_gen  <- colnames(ga_age$ra)
+ga_ord  <- c(fig1_pathogen_order[fig1_pathogen_order %in% ga_gen],
+             sort(ga_gen[!ga_gen %in% cf_pathogens]))
+ga_gold <- "#E69F00"
+ga_labs <- setNames(ifelse(rev(ga_ord) %in% cf_pathogens,
+  paste0("<span style='color:", ga_gold, "'><i>", rev(ga_ord), "</i></span>"),
+  paste0("<i>", rev(ga_ord), "</i>")), rev(ga_ord))
+
+ga_prep <- function(d, mult) {
+  d$sig  <- d$q < 0.05
+  d$path <- d$genus %in% cf_pathogens
+  qv <- ifelse(d$q < 0.001, formatC(d$q, format = "e", digits = 1),
+        ifelse(d$q < 0.01,  sprintf("%.3f", d$q), sprintf("%.2f", d$q)))
+  d$txt <- paste0("*Q* = ", qv)
+  d$qx  <- ifelse(d$OR < 1, d$lo / mult, d$hi * mult)
+  d$qh  <- ifelse(d$OR < 1, 1, 0)
+  d$genus <- factor(d$genus, levels = rev(ga_ord))
+  d
+}
+ga_A <- ga_prep(ga_A, 1.07); ga_B <- ga_prep(ga_B, 1.015)
+
+ga_panel <- function(d, brks, labl, lims, xlab, ylabs) {
+  p <- ggplot(d, aes(OR, genus, color = path)) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "gray40", linewidth = 0.5) +
+    geom_errorbar(aes(xmin = lo, xmax = hi), width = 0, linewidth = 0.6,
+                  orientation = "y") +
+    geom_point(aes(shape = sig), size = 2.2, fill = "white", stroke = 0.9) +
+    ggtext::geom_richtext(aes(x = qx, label = txt, hjust = qh), size = 2.8,
+                          color = "black", fill = NA, label.color = NA,
+                          label.padding = unit(0, "pt")) +
+    scale_color_manual(values = c(`TRUE` = ga_gold, `FALSE` = "black"), guide = "none") +
+    scale_shape_manual(values = c(`TRUE` = 16, `FALSE` = 21), guide = "none") +
+    scale_x_log10(breaks = brks, labels = labl, limits = lims,
+                  expand = expansion(mult = c(0.01, 0.01))) +
+    labs(x = xlab, y = NULL) +
+    gg_theme +
+    theme(aspect.ratio = 1,
+          axis.text.x  = element_text(size = 9.5, color = "black"),
+          axis.title.x = ggtext::element_markdown(size = 11, color = "black"),
+          axis.line    = element_blank(),
+          panel.border = element_rect(color = "black", fill = NA, linewidth = 0.25),
+          plot.tag     = element_text(size = 13, face = "bold"))
+  if (ylabs) p + scale_y_discrete(labels = ga_labs) +
+                 theme(axis.text.y = ggtext::element_markdown(size = 9.5))
+  else       p + scale_y_discrete(labels = rep("", length(ga_ord))) +
+                 theme(axis.text.y  = element_blank(),
+                       axis.ticks.y = element_line(color = "black", linewidth = 0.25))
+}
+ga_arrA <- paste0("<span style='font-size:9pt'>&#8592; Enriched in Children",
+  "<span style='color:white'>", strrep("n", 5), "</span>",
+  "Enriched in Adults &#8594;</span>")
+ga_arrB <- paste0("<span style='font-size:9pt'>&#8592; Better Lung Function",
+  "<span style='color:white'>", strrep("n", 5), "</span>",
+  "Worse Lung Function &#8594;</span>")
+
+ga_pA <- ga_panel(ga_A, c(0.25, 0.5, 1, 2, 4, 8), c("0.25", "0.5", "1", "2", "4", "8"),
+  c(0.11, 17),
+  paste0("Odds Ratio for Colonization<br>(Adults vs. Children)<br>", ga_arrA),
+  TRUE) + labs(tag = "A")
+ga_pB <- ga_panel(ga_B, c(0.75, 1, 1.25, 1.5), c("0.75", "1", "1.25", "1.5"),
+  c(0.63, 1.80),
+  paste0("Odds Ratio for Colonization<br>(per 10-Point Decrease in FEV<sub>1</sub> pp)<br>",
+         ga_arrB),
+  FALSE) + labs(tag = "B")
+
+figure_S3 <- ga_pA + ga_pB + patchwork::plot_layout(widths = c(1, 1))
+
+dir.create("figures", showWarnings = FALSE)
+ggsave("figures/figure_S3.pdf", figure_S3,
+       width = 12.5, height = 6.4, device = cairo_pdf)
+
+sprintf("A: %d individuals, %d of %d genera significant",
+        nrow(ga_age$ra), sum(ga_A$sig), nrow(ga_A))
+sprintf("B: %d individuals, %d of %d genera significant",
+        nrow(ga_lf$ra),  sum(ga_B$sig), nrow(ga_B))
+```
+
+### Figure S4 
+
+```{r fig_S4_analysis, include=FALSE}
+MIN_REGION_N <- 100
+
+region_vec <- cf_microbiome_metadata$Region[
+  match(rownames(genus_matrix_filt), cf_microbiome_metadata$Run)]
+
+overall_pairs <- pairwise_results[, c("genus1", "genus2", "bx", "pval", "significant")]
+names(overall_pairs)[names(overall_pairs) == "significant"] <- "sig"
+overall_pairs$r <- mapply(function(a, b) cor(log_abund[, a], log_abund[, b]),
+                          overall_pairs$genus1, overall_pairs$genus2)
+overall_pairs$direction <- ifelse(overall_pairs$bx > 0, "Positive", "Negative")
+
+region_levels <- sort(unique(region_vec))
+
+region_pair_list   <- list()
+region_concordance <- list()
+for (rg in region_levels) {
+  idx <- which(region_vec == rg)
+  rr  <- fit_region_pairs(log10(genus_matrix_filt[idx, , drop = FALSE] + 1))
+  rr$sig <- rr$pval < bonf_thresh
+
+  m <- merge(overall_pairs[, c("genus1", "genus2", "bx", "r", "sig", "direction")],
+             rr[, c("genus1", "genus2", "bx", "r", "sig")],
+             by = c("genus1", "genus2"), suffixes = c("_ov", "_rg"))
+  m$region <- rg
+  m$n      <- length(idx)
+  region_pair_list[[rg]] <- m
+
+  est   <- !is.na(m$bx_rg)                       # pair estimable in this region
+  ovsig <- m$sig_ov & est                        # associations "predicted" by the pooled model
+  region_concordance[[rg]] <- data.frame(
+    region           = rg,
+    n                = length(idx),
+    n_estimable      = sum(est),
+    n_sig_region     = sum(m$sig_rg & est, na.rm = TRUE),
+    n_overall_sig    = sum(ovsig),
+    sign_concordance = 100 * mean(sign(m$bx_rg[ovsig]) == sign(m$bx_ov[ovsig])),
+    spearman_bx      = cor(m$bx_ov[est], m$bx_rg[est], method = "spearman"),
+    ccc_bx           = ccc(m$bx_ov[est], m$bx_rg[est]),
+    pearson_std_r    = cor(m$r_ov[est],  m$r_rg[est],  method = "pearson"),
+    stringsAsFactors = FALSE)
+}
+region_pair_df     <- do.call(rbind, region_pair_list)
+region_concordance <- do.call(rbind, region_concordance)
+region_concordance$underpowered <- region_concordance$n < MIN_REGION_N
+
+dir.create("tables", showWarnings = FALSE)
+print(region_concordance, row.names = FALSE)
+```
+
+```{r fig_S4, include=FALSE}
+region_lab <- setNames(
+  sprintf("%s (N=%s)", region_concordance$region,
+          scales::comma(region_concordance$n)),
+  region_concordance$region)
+
+assoc_cols <- c("Positive" = "#4575B4", "Negative" = "#D73027",
+                "NS" = "gray75")
+
+AXIS_LIM <- range(c(region_pair_df$bx_ov, region_pair_df$bx_rg), na.rm = TRUE)
+AXIS_LIM <- AXIS_LIM + c(-1, 1) * 0.06 * diff(AXIS_LIM)
+
+pair_plot_df <- region_pair_df
+pair_plot_df$region_f <- factor(region_lab[pair_plot_df$region],
+                                levels = region_lab[region_levels])
+pair_plot_df$pt_class <- factor(
+  ifelse(!pair_plot_df$sig_ov, "NS", pair_plot_df$direction),
+  levels = c("Positive", "Negative", "NS"))
+pair_plot_df <- pair_plot_df[order(pair_plot_df$pt_class, decreasing = TRUE), ]
+
+facet_ann <- region_concordance
+facet_ann$region_f <- factor(region_lab[facet_ann$region],
+                             levels = region_lab[region_levels])
+facet_ann$txt <- sprintf("Signs %.0f%%  ·  CCC=%.2f",
+                         facet_ann$sign_concordance, facet_ann$ccc_bx)
+
+panel_S4A <- ggplot(pair_plot_df, aes(x = bx_ov, y = bx_rg)) +
+  geom_hline(yintercept = 0, color = "gray85", linewidth = 0.25) +
+  geom_vline(xintercept = 0, color = "gray85", linewidth = 0.25) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "gray50", linewidth = 0.4) +
+  geom_point(aes(fill = pt_class), shape = 21, color = "black",
+             stroke = 0.15, size = 1.5, alpha = 0.85) +
+  geom_text(data = facet_ann, aes(x = AXIS_LIM[1] + 0.03, y = AXIS_LIM[2] - 0.03,
+            label = txt), hjust = 0, vjust = 1, size = 2.7, color = "black",
+            inherit.aes = FALSE) +
+  facet_wrap(~ region_f, ncol = 4) +
+  scale_fill_manual(values = assoc_cols, name = NULL) +
+  scale_x_continuous(breaks = c(-2, -1, 0, 1)) +
+  scale_y_continuous(breaks = c(-2, -1, 0, 1)) +
+  coord_cartesian(xlim = AXIS_LIM, ylim = AXIS_LIM) +
+  labs(x = expression("Overall Covariation Coefficient ("*italic(b)*")"),
+       y = expression("Per-Region Covariation Coefficient ("*italic(b)*")"),
+       tag = "A") +
+  gg_theme +
+  theme(axis.text.x  = element_text(size = 10, color = "black"),
+        axis.text.y  = element_text(size = 10, color = "black"),
+        axis.title.x = element_text(size = 12, color = "black"),
+        axis.title.y = element_text(size = 12, color = "black"),
+        strip.text   = element_text(size = 11, color = "black"),
+        strip.background = element_blank(),
+        legend.position = "bottom",
+        legend.text  = element_text(size = 10),
+        plot.tag     = element_text(size = 12, face = "bold")) +
+  guides(fill = guide_legend(override.aes = list(size = 3, alpha = 1)))
+
+metric_levels <- c("Signs Matched", "Spearman Rank", "CCC")
+metric_df <- rbind(
+  data.frame(region = region_concordance$region, metric = metric_levels[1],
+             value = region_concordance$sign_concordance / 100),
+  data.frame(region = region_concordance$region, metric = metric_levels[2],
+             value = region_concordance$spearman_bx),
+  data.frame(region = region_concordance$region, metric = metric_levels[3],
+             value = region_concordance$ccc_bx))
+metric_df$metric <- factor(metric_df$metric, levels = metric_levels)
+
+metric_df$region_f <- factor(metric_df$region, levels = rev(region_levels))
+
+metric_cols  <- setNames(c("#4575B4", "#E69F00", "#333333"), metric_levels)
+metric_shape <- setNames(c(16, 17, 15), metric_levels)
+
+panel_S4B <- ggplot(metric_df, aes(x = value, y = region_f,
+                                   color = metric, shape = metric)) +
+  geom_point(size = 2.6, position = position_dodge(width = 0.6)) +
+  scale_color_manual(values = metric_cols, name = NULL) +
+  scale_shape_manual(values = metric_shape, name = NULL) +
+  scale_x_continuous(breaks = seq(0.4, 1, 0.2)) +
+  coord_cartesian(xlim = c(min(metric_df$value) - 0.03, 1)) +
+  labs(x = "Concordance With Pooled Analysis", y = NULL, tag = "B") +
+  gg_theme +
+  theme(axis.text.x        = element_text(size = 10, color = "black"),
+        axis.text.y        = element_text(size = 10, color = "black"),
+        axis.title.x       = element_text(size = 12, color = "black"),
+        legend.position    = "bottom",
+        legend.text        = element_text(size = 10),
+        plot.tag           = element_text(size = 12, face = "bold"),
+        panel.grid.major.x = element_line(color = "gray92", linewidth = 0.25))
+
+figure_S4 <- panel_S4A / panel_S4B +
+  patchwork::plot_layout(heights = c(1.5, 1))
+
+dir.create("figures", showWarnings = FALSE)
+ggsave("figures/figure_S4.pdf", figure_S4, width = 9, height = 8.5,
+       device = cairo_pdf)
+```
+
+### Figure S5
+
+```{r fig_S5, include=FALSE}
 present_pathogens <- sort(intersect(fig1_pathogen_order, unique(bp_df$dominant_pathogen)))
 present_pathogens <- setdiff(present_pathogens, "Haemophilus")
 dom_path_levels   <- c(present_pathogens, "Other")
@@ -2607,7 +3444,7 @@ dom_path_labels <- setNames(
   dom_path_levels
 )
 
-panel_S2_base <- ggplot(bp_plot_df_s2, aes(x = bp_dom, y = FEV1_adj)) +
+panel_S5_base <- ggplot(bp_plot_df_s2, aes(x = bp_dom, y = FEV1_adj)) +
   geom_line(data = boot_lines_bp, aes(x = x, y = y, group = boot),
             color = "lightpink", alpha = 0.15) +
   geom_vline(xintercept = 0.5, linetype = "dashed",
@@ -2632,20 +3469,20 @@ panel_S2_base <- ggplot(bp_plot_df_s2, aes(x = bp_dom, y = FEV1_adj)) +
   guides(fill = guide_legend(nrow = 4, ncol = 2, byrow = TRUE,
                              override.aes = list(alpha = 1, size = 1.5, shape = 21)))
 
-panel_S2_fixed <- egg::set_panel_size(panel_S2_base,
+panel_S5_fixed <- egg::set_panel_size(panel_S5_base,
                                        width  = fig2_panel_size,
                                        height = fig2_panel_size)
 
-figure_S3 <- panel_S2_fixed
+figure_S5 <- panel_S5_fixed
 
 dir.create("figures", showWarnings = FALSE)
-ggsave("figures/figure_S3.pdf", figure_S3,
+ggsave("figures/figure_S5.pdf", figure_S5,
        width = 7, height = 6, device = cairo_pdf)
 ```
 
-### Figure S4
+### Figure S6
 
-```{r fig_S4, include=FALSE}
+```{r fig_S6, include=FALSE}
 hid_bold_S4       <- c("HID7", "HID8")
 isolate_hilite_S4 <- c("NB0017", "NB0078", "NB1046", "NB0219", "RSD0018", "NB1386")
 
@@ -2674,7 +3511,7 @@ hid_axis_labels_S4 <- setNames(
   hid_order_S4
 )
 
-panel_S4 <- ggplot(s4_df, aes(x = hid, y = z_within_genus)) +
+panel_S6 <- ggplot(s4_df, aes(x = hid, y = z_within_genus)) +
   geom_hline(yintercept = 0, linetype = "dashed",
              color = "gray40", linewidth = 0.5) +
   geom_boxplot(outlier.shape = NA, fill = "gray92",
@@ -2688,22 +3525,23 @@ panel_S4 <- ggplot(s4_df, aes(x = hid, y = z_within_genus)) +
   fig1_theme +
   theme(axis.text.x = ggtext::element_markdown(angle = 45, hjust = 1, size = 10))
 
-figure_S4 <- panel_S4
+figure_S6 <- panel_S6
 
 dir.create("figures", showWarnings = FALSE)
-ggsave("figures/figure_S4.pdf", figure_S4,
+ggsave("figures/figure_S6.pdf", figure_S6,
        width = 9, height = 4.5, device = cairo_pdf)
 ```
 
-### Figure S5B
+### Figure S7B
 
-```{r fig_S5B, include=FALSE}
+```{r fig_S7B, include=FALSE}
 lcms_iso_sub <- t(apply(lcms_sub, 1, function(v) tapply(v, lcms_iso, mean)))
 lcms_iprof   <- t(lcms_iso_sub); lcms_iprof <- lcms_iprof / rowSums(lcms_iprof)
 dir.create("r_objects", showWarnings = FALSE)
 if (file.exists("r_objects/lcms_permanova.rds")) {
   lcms_perm <- readRDS("r_objects/lcms_permanova.rds")
 } else {
+  set.seed(8675309)   # PERMANOVA permutation reproducibility
   lcms_perm <- adonis2(vegdist(lcms_iprof, "bray") ~ host + inhibition,
                        data = lcms_iso_meta, by = "margin", permutations = lcms_n_perm)
   saveRDS(lcms_perm, "r_objects/lcms_permanova.rds")
@@ -2726,7 +3564,7 @@ lcms_pcoa  <- cmdscale(vegdist(lcms_sprof, "bray"), k = 2, eig = TRUE)
 lcms_pvar  <- round(100 * lcms_pcoa$eig[1:2] / sum(lcms_pcoa$eig[lcms_pcoa$eig > 0]), 1)
 lcms_mdsdf <- data.frame(lcms_samp_meta, PCoA1 = lcms_pcoa$points[, 1], PCoA2 = lcms_pcoa$points[, 2])
 
-figure_S5B <- ggplot(lcms_mdsdf, aes(PCoA1, PCoA2)) +
+figure_S7B <- ggplot(lcms_mdsdf, aes(PCoA1, PCoA2)) +
   stat_ellipse(aes(color = host, group = host), type = "t", linewidth = 0.4, show.legend = FALSE) +
   stat_ellipse(data = subset(lcms_mdsdf, inhibition == "Yes"), color = lcms_inh_pal[["Yes"]],
                type = "t", linetype = "22", linewidth = 1) +
@@ -2737,10 +3575,10 @@ figure_S5B <- ggplot(lcms_mdsdf, aes(PCoA1, PCoA2)) +
   scale_shape_manual(values = c(Yes = 16, No = 17), name = "Inhibition\nZ-Score ≥ 0") +
   labs(x = sprintf("PCoA1 (%.1f%%)", lcms_pvar[1]), y = sprintf("PCoA2 (%.1f%%)", lcms_pvar[2])) +
   coord_fixed(ratio = 1) + fig1_theme
-lcms_xy  <- do.call(rbind, lapply(ggplot_build(figure_S5B)$data, function(d) d[c("x", "y")]))
+lcms_xy  <- do.call(rbind, lapply(ggplot_build(figure_S7B)$data, function(d) d[c("x", "y")]))
 lcms_lim <- range(lcms_xy, na.rm = TRUE); lcms_lim <- lcms_lim + c(-0.03, 0.03) * diff(lcms_lim)
-figure_S5B <- figure_S5B + coord_fixed(ratio = 1, xlim = lcms_lim, ylim = lcms_lim)
+figure_S7B <- figure_S7B + coord_fixed(ratio = 1, xlim = lcms_lim, ylim = lcms_lim)
 
 dir.create("figures", showWarnings = FALSE)
-ggsave("figures/figure_S5B.pdf", figure_S5B, width = 6.5, height = 6.5, device = cairo_pdf)
+ggsave("figures/figure_S7B.pdf", figure_S7B, width = 6.5, height = 6.5, device = cairo_pdf)
 ```
