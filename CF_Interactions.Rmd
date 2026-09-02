@@ -715,7 +715,10 @@ interaction_df$sig_interaction <- interaction_df$fdr_interaction < 0.05
 covar_pairs <- pairwise_results[pairwise_results$significant, c("genus1", "genus2")]
 sig_taxa    <- unique(c(covar_pairs$genus1, covar_pairs$genus2))
 
-pres_matrix   <- genus_matrix_filt[fev1_runs, , drop = FALSE] > 0
+PRES_THRESH   <- 1     # a genus counts as present at >=1% within-sample relative abundance
+pres_ra       <- 100 * genus_matrix_filt / rowSums(genus_matrix_filt)
+pres_ra[!is.finite(pres_ra)] <- 0
+pres_matrix   <- pres_ra[fev1_runs, , drop = FALSE] >= PRES_THRESH
 n_interacting <- rowSums(pres_matrix[, covar_pairs$genus1, drop = FALSE] &
                          pres_matrix[, covar_pairs$genus2, drop = FALSE])
 bioproject    <- fev1_meta$BioProject
@@ -1640,7 +1643,9 @@ panel_1c <- ggplot(bp_plot_df, aes(x = bp_dom, y = FEV1_adj)) +
   geom_jitter(aes(color = dom_type),
               width = 0.005, alpha = 0.4, size = 1.5) +
   geom_smooth(method = "lm", color = "#D73027", se = FALSE, linewidth = 1.1) +
-  scale_color_manual(values = dom_type_cols, labels = dom_type_labels) +
+  scale_color_manual(values = dom_type_cols, labels = dom_type_labels,
+                     name = "Dominant
+Taxon") +
   scale_x_continuous(breaks = seq(0.2, 1.0, 0.2)) +
   scale_y_continuous() +
   labs(x = "Dominance (BP)",
@@ -1648,7 +1653,7 @@ panel_1c <- ggplot(bp_plot_df, aes(x = bp_dom, y = FEV1_adj)) +
   fig1_theme +
   theme(legend.position    = "bottom",
         legend.text        = element_text(size = 9),
-        legend.title       = element_blank(),
+        legend.title       = element_text(size = 9, face = "bold"),
         legend.key.height  = unit(0.35, "cm"),
         legend.spacing.y   = unit(0, "cm")) +
   guides(color = guide_legend(nrow = 1, reverse = TRUE,
@@ -1774,7 +1779,7 @@ panel_2a <- ggplot(bubble_df, aes(x = col_genus, y = row_genus)) +
              color = "black", stroke = 0.3) +
   scale_fill_manual(values = c("Negative" = "#D73027", "Positive" = "#4575B4"),
                     name = "Association") +
-  scale_size_continuous(range = c(0.75, 5.25), name = "Coefficient (|b|)",
+  scale_size_continuous(range = c(0.75, 5.25), name = "Coefficient Magnitude",
                         breaks = c(0.05, 0.1, 0.5, 0.75),
                         labels = c("0.05", "0.10", "0.50", "0.75")) +
   scale_x_discrete(limits = genus_order[-length(genus_order)],
@@ -1899,20 +1904,30 @@ ggsave("figures/figure_2A_upset_inset.pdf", upset_inset_2a,
 ### Figure 2B
 
 ```{r fig_2B, include=FALSE}
-age_levels  <- age_label_map[age_levels_raw]
-color_vals <- setNames(unname(age_base_cols[age_levels_raw]), age_levels)
+# dominance is taken from bp_df so the definition matches Figure 1C exactly
+b2_runs <- fev1_runs[complete_idx]
+b2_dom  <- setNames(bp_df$dominant_pathogen, bp_df$sample)[b2_runs]
+b2_type <- factor(ifelse(is.na(b2_dom) | b2_dom == "Other",
+                         "Oropharyngeal", "Pathogen"),
+                  levels = c("Pathogen", "Oropharyngeal"))
+b2_cnt  <- table(b2_type)
+b2_labs <- setNames(paste0(names(b2_cnt), " (N=",
+                           scales::comma(as.integer(b2_cnt)), ")"),
+                    names(b2_cnt))
 
 plot_df_adj <- data.frame(
   n_taxa    = n_interacting_adj,
   fev1_adj  = fev1_adjusted,
-  age_group = factor(fev1_age_adj, levels = age_levels))
+  dom_type  = b2_type)
 
 panel_2b <- ggplot(plot_df_adj, aes(x = n_taxa, y = fev1_adj)) +
   geom_line(data = boot_lines_adj, aes(x = x, y = y, group = boot),
             color = "lightblue", alpha = 0.15) +
-  geom_jitter(aes(color = age_group), width = 0.4, alpha = 0.4, size = 1.5) +
+  geom_jitter(aes(color = dom_type), width = 0.4, alpha = 0.4, size = 1.5) +
   geom_smooth(method = "lm", color = "#4575B4", se = FALSE, linewidth = 1.1) +
-  scale_color_manual(values = color_vals, name = "Age") +
+  scale_color_manual(values = dom_type_cols, labels = b2_labs,
+                     name = "Dominant
+Taxon") +
   scale_y_continuous(breaks = seq(25, 125, 25)) +
   coord_cartesian(ylim = c(12, 141)) +
   labs(x = "Pairs of Covarying Genera",
@@ -1929,7 +1944,8 @@ panel_2b <- ggplot(plot_df_adj, aes(x = n_taxa, y = fev1_adj)) +
         legend.text  = element_text(size = 10),
         legend.title = element_text(size = 10, face = "bold"),
         plot.tag = element_text(size = 12, face = "bold")) +
-  guides(color = guide_legend(nrow = 2, byrow = TRUE))
+  guides(color = guide_legend(nrow = 1, reverse = TRUE,
+                              override.aes = list(alpha = 1, size = 2.5)))
 ```
 
 ### Figure 2C
@@ -2345,10 +2361,10 @@ figure_4 <- ggplot(sy_pairs, aes(pct_inh, bx)) +
               fill = "#D73027", alpha = 0.16, linewidth = 1.0) +
   geom_point(aes(color = pair_type, size = assays), alpha = 0.9) +
   scale_color_manual(values = sy_cols) +
-  scale_size_continuous(range = c(1.8, 6), breaks = c(20, 100, 500, 1200)) +
+  scale_size_continuous(range = c(1.4, 4.6), breaks = c(20, 100, 500, 1200)) +
   scale_x_continuous("Target Inhibition in Cross-Streak Assays (%)",
                      breaks = seq(0, 80, 20)) +
-  scale_y_continuous(expression("Covariation Coefficient ("*italic(b)*")"),
+  scale_y_continuous("Covariation Coefficient",
                      breaks = seq(-0.1, 0.5, 0.1),
                      labels = sprintf("%.1f", seq(-0.1, 0.5, 0.1))) +
   coord_cartesian(xlim = c(-6, 92), ylim = c(-0.18, 0.60)) +
@@ -2361,7 +2377,7 @@ figure_4 <- ggplot(sy_pairs, aes(pct_inh, bx)) +
         axis.ticks    = element_line(color = "black", linewidth = 0.3),
         legend.position   = "bottom",
         legend.title      = element_text(size = 9.2),
-        legend.text       = element_text(size = 9.2, family = "Segoe UI Symbol"),
+        legend.text       = element_text(size = 9.2),
         legend.key        = element_blank(),
         legend.background = element_blank(),
         legend.key.height = unit(0.32, "cm"),
@@ -2369,12 +2385,75 @@ figure_4 <- ggplot(sy_pairs, aes(pct_inh, bx)) +
         legend.spacing.y  = unit(0.5, "cm"),
         legend.margin     = margin(t = 0, b = 0)) +
   guides(color = guide_legend(title = NULL, nrow = 2, order = 1,
-                              override.aes = list(size = 2.8)),
+                              override.aes = list(size = 2.4)),
          size  = guide_legend(title = "Number of Assays", nrow = 1, order = 2,
                               title.position = "left", title.vjust = 0.5))
 
+SY_SYMFONT <- "Segoe UI Symbol"
+SY_GAP     <- 4.5   # pt of space on each side of the inhibition bar
+SY_RAISE   <- 0.6   # pt lift so the bar centres on the cap height, not the baseline
+sy_metrics <- function(s, fam, fs, K = 100) {
+  m <- systemfonts::shape_string(s, family = fam, size = fs * K)$metrics
+  list(adv = m$width / K, lb = m$left_bearing / K, rb = m$right_bearing / K)
+}
+sy_mixed <- function(g0) {
+  parts <- trimws(strsplit(g0$label, SY_BAR, fixed = TRUE)[[1]])
+  fs  <- if (is.null(g0$gp$fontsize)) 9.2 else g0$gp$fontsize
+  fam <- if (is.null(g0$gp$fontfamily) || !nzchar(g0$gp$fontfamily)) "Arial"
+         else g0$gp$fontfamily
+  m1 <- sy_metrics(parts[1], fam, fs)
+  mb <- sy_metrics(SY_BAR, SY_SYMFONT, fs)
+  m2 <- sy_metrics(parts[2], fam, fs)
+  # place on ink edges, not advance widths, so the gaps either side of the bar
+  # are equal to the eye
+  xb  <- (m1$adv - m1$rb) + SY_GAP - mb$lb
+  x2  <- (xb + mb$adv - mb$rb) + SY_GAP - m2$lb
+  off <- c(0, xb, x2)
+  txt <- c(parts[1], SY_BAR, parts[2])
+  gps <- lapply(c("", SY_SYMFONT, ""), function(f) {
+    g <- g0$gp; if (nzchar(f)) g$fontfamily <- f; g
+  })
+  gt <- grid::gTree(children = do.call(grid::gList, mapply(function(s, g, o, r)
+    grid::textGrob(s, x = g0$x + grid::unit(o, "pt"),
+                   y = g0$y + grid::unit(r, "pt"),
+                   hjust = 0, vjust = g0$vjust, gp = g),
+    txt, gps, off, c(0, SY_RAISE, 0), SIMPLIFY = FALSE)))
+  attr(gt, "sy_w") <- x2 + m2$adv
+  gt
+}
+sy_fix <- function(x) {
+  if (inherits(x, "gtable")) {
+    for (k in seq_along(x$grobs)) {
+      x$grobs[[k]] <- sy_fix(x$grobs[[k]])
+      w  <- attr(x$grobs[[k]], "sy_w")
+      cl <- x$layout$l[k]
+      if (!is.null(w)) {
+        x$widths[cl] <- grid::unit.pmax(x$widths[cl], grid::unit(w + 5.5, "pt"))
+      }
+    }
+    x
+  }
+  else if (inherits(x, "gTree")) {
+    if (!is.null(x$children)) {
+      x$children <- do.call(grid::gList, lapply(x$children, sy_fix))
+      w <- vapply(x$children, function(ch) {
+        a <- attr(ch, "sy_w"); if (is.null(a)) NA_real_ else a
+      }, numeric(1))
+      if (any(!is.na(w))) attr(x, "sy_w") <- max(w, na.rm = TRUE)
+    }
+    x
+  } else if (inherits(x, "text") && length(x$label) == 1 &&
+             grepl(SY_BAR, x$label, fixed = TRUE)) sy_mixed(x) else x
+}
+
 dir.create("figures", showWarnings = FALSE)
-ggsave("figures/figure_4.pdf", figure_4, width = 5.8, height = 6.5,
+figure_4_sized <- egg::set_panel_size(figure_4 + theme(aspect.ratio = NULL),
+                                      width  = fig2_panel_size,
+                                      height = fig2_panel_size)
+figure_4_sized <- sy_fix(figure_4_sized)
+ggsave("figures/figure_4.pdf", figure_4_sized,
+       width  = sum(grid::convertWidth(figure_4_sized$widths, "in", valueOnly = TRUE)),
+       height = sum(grid::convertHeight(figure_4_sized$heights, "in", valueOnly = TRUE)),
        device = cairo_pdf)
 
 sprintf("Figure 4: %d genus pairs, Spearman rho = %.3f, P = %.4f",
@@ -3360,8 +3439,8 @@ panel_S4A <- ggplot(pair_plot_df, aes(x = bx_ov, y = bx_rg)) +
   scale_x_continuous(breaks = c(-2, -1, 0, 1)) +
   scale_y_continuous(breaks = c(-2, -1, 0, 1)) +
   coord_cartesian(xlim = AXIS_LIM, ylim = AXIS_LIM) +
-  labs(x = expression("Overall Covariation Coefficient ("*italic(b)*")"),
-       y = expression("Per-Region Covariation Coefficient ("*italic(b)*")"),
+  labs(x = "Overall Covariation Coefficient",
+       y = "Per-Region Covariation Coefficient",
        tag = "A") +
   gg_theme +
   theme(axis.text.x  = element_text(size = 10, color = "black"),
